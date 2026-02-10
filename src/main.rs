@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode};
@@ -9,7 +9,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
@@ -17,6 +17,7 @@ use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = "PromptPetrol";
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UsageEntry {
@@ -140,14 +141,32 @@ fn main() -> Result<()> {
 }
 
 fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(Duration::from_millis(250))? {
+
+        let elapsed = last_refresh.elapsed();
+        let timeout = if elapsed >= AUTO_REFRESH_INTERVAL {
+            Duration::from_millis(0)
+        } else {
+            AUTO_REFRESH_INTERVAL - elapsed
+        };
+
+        if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.code == KeyCode::Char('q') => break,
-                Event::Key(key) if key.code == KeyCode::Char('r') => app.reload(),
+                Event::Key(key) if key.code == KeyCode::Char('r') => {
+                    app.reload();
+                    last_refresh = Instant::now();
+                }
                 _ => {}
             }
+            continue;
+        }
+
+        if last_refresh.elapsed() >= AUTO_REFRESH_INTERVAL {
+            app.reload();
+            last_refresh = Instant::now();
         }
     }
     Ok(())
@@ -155,15 +174,22 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
     let stats = UsageStats::from_data(&app.data);
+    let area = frame.area();
+    let compact_width = area.width < 100;
+    let compact_height = area.height < 24;
+
+    let stats_height = if compact_width { 11 } else { 7 };
+    let details_min_height = if compact_height { 6 } else { 8 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Min(8),
+            Constraint::Length(stats_height),
+            Constraint::Min(details_min_height),
             Constraint::Length(3),
         ])
-        .split(frame.area());
+        .split(area);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -178,14 +204,25 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     .block(Block::default().borders(Borders::ALL).title("Overview"));
     frame.render_widget(title, chunks[0]);
 
-    let stat_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(chunks[1]);
+    let stat_chunks = if compact_width {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Min(3),
+            ])
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(chunks[1])
+    };
 
     frame.render_widget(
         Paragraph::new(format!(
@@ -224,17 +261,26 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         stat_chunks[2],
     );
 
-    let details = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[2]);
+    let details = if compact_width || compact_height {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(chunks[2])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(chunks[2])
+    };
+
+    let max_rows = max_visible_rows(details[0]);
 
     let rows = app
         .data
         .entries
         .iter()
         .rev()
-        .take(8)
+        .take(max_rows)
         .map(|e| {
             ListItem::new(format!(
                 "{} | {:<6} | {:<12} | {} tok | ${:.4}",
@@ -274,9 +320,19 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         details[1],
     );
 
-    let footer = Paragraph::new(format!("q: quit | r: reload | {}", app.status))
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    let footer = Paragraph::new(format!(
+        "q: quit | r: reload | auto: {}s | {}x{} | {}",
+        AUTO_REFRESH_INTERVAL.as_secs(),
+        area.width,
+        area.height,
+        app.status
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Controls"));
     frame.render_widget(footer, chunks[3]);
+}
+
+fn max_visible_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2)).max(1)
 }
 
 fn init_terminal() -> Result<DefaultTerminal> {

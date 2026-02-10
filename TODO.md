@@ -8,8 +8,8 @@
 - [x] Implement local persistence (JSON)
 - [x] Create interactive dashboard for usage and cost tracking
 - [x] Add budget alerts and threshold indicators
-- [ ] Add realtime refresh loop for live token monitoring
-- [ ] Add dynamic layout handling for variable terminal columns and rows
+- [x] Add realtime refresh loop for live token monitoring
+- [x] Add dynamic layout handling for variable terminal columns and rows
 - [ ] Add provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and other model providers
 - [ ] Normalize provider usage into a common token/cost schema
 - [ ] Add config support for API keys and model pricing
