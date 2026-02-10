@@ -1,0 +1,29 @@
+/target
+
+# Rust
+**/*.rs.bk
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+*.tmp
+tmp/
+
+# Codex / agent-related local artifacts
+.codex/
+AGENTS.md
