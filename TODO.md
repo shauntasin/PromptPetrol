@@ -10,7 +10,7 @@
 - [x] Add budget alerts and threshold indicators
 - [x] Add realtime refresh loop for live token monitoring
 - [x] Add dynamic layout handling for variable terminal columns and rows
-- [ ] Add provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and other model providers
-- [ ] Normalize provider usage into a common token/cost schema
-- [ ] Add config support for API keys and model pricing
+- [x] Add provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and other model providers
+- [x] Normalize provider usage into a common token/cost schema
+- [x] Add config support for API keys and model pricing
 - [x] Write setup and usage documentation
