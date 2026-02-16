@@ -10,6 +10,7 @@ PromptPetrol is a Rust TUI app for monitoring AI token usage like fuel usage.
 - JSON-backed local storage.
 - Provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and generic formats.
 - Normalization into a common `input_tokens` / `output_tokens` / `cost_usd` schema.
+- Automatic Codex CLI usage import from `~/.codex/sessions` (cached for fast refresh).
 - Config-driven API keys and model pricing for cost estimation.
 
 ## Run
@@ -74,6 +75,21 @@ Example:
       "input_per_million_usd": 3.0,
       "output_per_million_usd": 15.0
     }
+  },
+  "codex_import": {
+    "enabled": true,
+    "sessions_dir": null,
+    "model": "codex-cli"
   }
 }
 ```
+
+## Codex usage import
+
+When `codex_import.enabled` is true, PromptPetrol reads Codex session `.jsonl` files from:
+
+- Default: `~/.codex/sessions`
+- Or custom: `codex_import.sessions_dir`
+
+PromptPetrol uses the latest `token_count` totals found in each session file and adds them as `provider = "codex"` entries in the dashboard.
+It also shows Codex rate-limit usage in Alerts (5-hour and weekly) when available in session events.
