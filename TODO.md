@@ -14,3 +14,6 @@
 - [x] Normalize provider usage into a common token/cost schema
 - [x] Add config support for API keys and model pricing
 - [x] Write setup and usage documentation
+
+- [x] Live codex limit tracking is not working
+- [x] Live tracking should refresh every 10 seconds i.e 0.1hz

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const APP_NAME: &str = "PromptPetrol";
-const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UsageEntry {
@@ -886,6 +886,7 @@ struct CachedCodexSession {
     timestamp: String,
     input_tokens: u64,
     output_tokens: u64,
+    has_token_usage: bool,
     limits: Option<CodexRateLimits>,
 }
 
@@ -948,6 +949,7 @@ fn merge_codex_usage(data: &mut UsageData, config: &AppConfig, cache: &mut Codex
     let mut imported = cache
         .sessions
         .values()
+        .filter(|session| session.has_token_usage)
         .map(|session| {
             let model = &config.codex_import.model;
             UsageEntry {
@@ -1009,23 +1011,26 @@ fn collect_jsonl_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Re
 
 fn parse_codex_session_file(path: &Path, modified: SystemTime) -> Option<CachedCodexSession> {
     let contents = fs::read_to_string(path).ok()?;
-    let (timestamp, input_tokens, output_tokens, limits) = parse_codex_session_contents(&contents)?;
+    let (timestamp, input_tokens, output_tokens, has_token_usage, limits) =
+        parse_codex_session_contents(&contents)?;
     Some(CachedCodexSession {
         modified,
         timestamp,
         input_tokens,
         output_tokens,
+        has_token_usage,
         limits,
     })
 }
 
 fn parse_codex_session_contents(
     contents: &str,
-) -> Option<(String, u64, u64, Option<CodexRateLimits>)> {
+) -> Option<(String, u64, u64, bool, Option<CodexRateLimits>)> {
     let mut session_timestamp: Option<String> = None;
-    let mut latest_timestamp: Option<String> = None;
-    let mut input_tokens: Option<u64> = None;
-    let mut output_tokens: Option<u64> = None;
+    let mut latest_event_timestamp: Option<String> = None;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut has_token_usage = false;
     let mut latest_limits: Option<CodexRateLimits> = None;
 
     for line in contents.lines() {
@@ -1046,6 +1051,23 @@ fn parse_codex_session_contents(
             continue;
         }
 
+        let event_timestamp = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(ts) = event_timestamp.as_ref() {
+            latest_event_timestamp = Some(ts.clone());
+            let primary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/primary"));
+            let secondary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/secondary"));
+            if primary.is_some() || secondary.is_some() {
+                latest_limits = Some(CodexRateLimits {
+                    timestamp: ts.clone(),
+                    primary,
+                    secondary,
+                });
+            }
+        }
+
         let maybe_input = v
             .pointer("/payload/info/total_token_usage/input_tokens")
             .and_then(Value::as_u64);
@@ -1054,29 +1076,23 @@ fn parse_codex_session_contents(
             .and_then(Value::as_u64);
 
         if let (Some(input), Some(output)) = (maybe_input, maybe_output) {
-            input_tokens = Some(input);
-            output_tokens = Some(output);
-            if let Some(ts) = v
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            {
-                latest_timestamp = Some(ts.clone());
-                let primary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/primary"));
-                let secondary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/secondary"));
-                if primary.is_some() || secondary.is_some() {
-                    latest_limits = Some(CodexRateLimits {
-                        timestamp: ts,
-                        primary,
-                        secondary,
-                    });
-                }
-            }
+            input_tokens = input;
+            output_tokens = output;
+            has_token_usage = true;
         }
     }
 
-    let timestamp = latest_timestamp.or(session_timestamp)?;
-    Some((timestamp, input_tokens?, output_tokens?, latest_limits))
+    let timestamp = latest_event_timestamp.or(session_timestamp)?;
+    if !has_token_usage && latest_limits.is_none() {
+        return None;
+    }
+    Some((
+        timestamp,
+        input_tokens,
+        output_tokens,
+        has_token_usage,
+        latest_limits,
+    ))
 }
 
 fn parse_codex_rate_limit(node: Option<&Value>) -> Option<CodexRateLimit> {
@@ -1333,22 +1349,35 @@ mod tests {
         assert_eq!(parsed.0, "2026-02-16T09:45:56.220Z");
         assert_eq!(parsed.1, 17438);
         assert_eq!(parsed.2, 326);
-        assert!(parsed.3.is_none());
+        assert!(parsed.3);
+        assert!(parsed.4.is_none());
     }
 
     #[test]
     fn parses_codex_rate_limits() {
         let payload = r#"{"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17438,"output_tokens":326}},"rate_limits":{"primary":{"used_percent":7.0,"window_minutes":300,"resets_at":1771243734},"secondary":{"used_percent":25.0,"window_minutes":10080,"resets_at":1771317088}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
-        let limits = parsed.3.expect("expected limits");
+        assert!(parsed.3);
+        let limits = parsed.4.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").window_minutes, 300);
         assert_eq!(limits.secondary.expect("secondary").window_minutes, 10080);
     }
 
     #[test]
-    fn codex_parser_returns_none_without_token_count() {
+    fn codex_parser_returns_none_without_token_count_or_limits() {
         let payload = r#"{"timestamp":"2026-02-16T09:45:42.927Z","type":"session_meta","payload":{"timestamp":"2026-02-16T09:45:42.927Z"}}
 {"timestamp":"2026-02-16T09:45:43.000Z","type":"response_item","payload":{"type":"message"}}"#;
         assert!(parse_codex_session_contents(payload).is_none());
+    }
+
+    #[test]
+    fn parses_codex_rate_limits_when_info_is_null() {
+        let payload = r#"{"timestamp":"2026-02-17T13:47:12.863Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":3.0,"window_minutes":300,"resets_at":1771348283},"secondary":{"used_percent":2.0,"window_minutes":10080,"resets_at":1771922246}}}}"#;
+        let parsed = parse_codex_session_contents(payload).expect("expected codex limits");
+        assert_eq!(parsed.0, "2026-02-17T13:47:12.863Z");
+        assert!(!parsed.3);
+        let limits = parsed.4.expect("expected limits");
+        assert_eq!(limits.primary.expect("primary").used_percent, 3.0);
+        assert_eq!(limits.secondary.expect("secondary").used_percent, 2.0);
     }
 }
