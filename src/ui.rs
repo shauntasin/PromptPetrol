@@ -1,11 +1,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::App;
 use crate::codex_import::{CodexRateLimit, CodexRateLimits, latest_codex_limits};
@@ -91,11 +91,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         } else {
             format!(
                 "{APP_NAME} | {} | ${:.3} | {} tok | {} req",
-                provider.provider, provider.total_cost_usd, provider.total_tokens, provider.requests
+                provider.provider,
+                provider.total_cost_usd,
+                provider.total_tokens,
+                provider.requests
             )
         }
     } else {
         format!("{APP_NAME} | No provider data")
+    };
+    let info_line = if app.status.is_empty() {
+        basic_line
+    } else {
+        format!("{basic_line} | {}", app.status)
     };
     let alert_lines = if is_codex {
         build_codex_alert_lines(codex_limits.as_ref())
@@ -103,7 +111,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         build_alert_lines(fuel_ratio, token_ratio, spend_ratio, activity_ratio)
     };
     frame.render_widget(
-        Paragraph::new(basic_line).block(Block::default().borders(Borders::ALL).title("Info")),
+        Paragraph::new(info_line).block(Block::default().borders(Borders::ALL).title("Info")),
         chunks[0],
     );
     frame.render_widget(
@@ -146,6 +154,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         render_analog_gauge(frame, top_gauges[1], "RPM", token_ratio, "load");
         render_analog_gauge(frame, bottom_gauges[0], "Throttle", spend_ratio, "burn");
         render_analog_gauge(frame, bottom_gauges[1], "Traffic", activity_ratio, "flow");
+    }
+
+    if app.show_help {
+        draw_help_overlay(frame);
     }
 }
 
@@ -274,10 +286,7 @@ fn alert_line(label: &str, alert: bool, ratio: f64, low_is_bad: bool) -> Line<'s
     let state_bg = if healthy { Color::Green } else { Color::Yellow };
 
     Line::from(vec![
-        Span::styled(
-            format!(" {label:<11} "),
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled(format!(" {label:<11} "), Style::default().fg(Color::Gray)),
         Span::styled(
             format!(" {state} "),
             Style::default()
@@ -370,4 +379,45 @@ fn format_reset_timing(resets_at: Option<u64>) -> String {
     let hours = remaining / 3600;
     let minutes = (remaining % 3600) / 60;
     format!("in {hours}h {minutes}m")
+}
+
+fn draw_help_overlay(frame: &mut Frame<'_>) {
+    let area = centered_rect(60, 40, frame.area());
+    let help_lines = vec![
+        Line::from("Controls"),
+        Line::from("q : quit"),
+        Line::from("r : reload usage/config"),
+        Line::from("Left/h/k : previous provider"),
+        Line::from("Right/l/j : next provider"),
+        Line::from("? : toggle help"),
+    ];
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(help_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Keyboard Help"),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }

@@ -1,6 +1,6 @@
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode};
@@ -10,14 +10,14 @@ use crossterm::terminal::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::codex_import::{CodexImportCache, merge_codex_usage};
+use crate::codex_import::{CodexImportCache, codex_import_diagnostics, merge_codex_usage};
 use crate::models::{
     AppConfig, UsageData, default_config_file, default_data_file, load_or_bootstrap_config,
     load_or_bootstrap_data, provider_summaries,
 };
 use crate::ui::draw;
 
-const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(crate) struct App {
     data_file: PathBuf,
@@ -27,6 +27,7 @@ pub(crate) struct App {
     pub(crate) selected_provider: Option<String>,
     pub(crate) status: String,
     pub(crate) codex_cache: CodexImportCache,
+    pub(crate) show_help: bool,
 }
 
 impl App {
@@ -35,14 +36,16 @@ impl App {
         let mut data = load_or_bootstrap_data(&data_file, &config)?;
         let mut codex_cache = CodexImportCache::default();
         merge_codex_usage(&mut data, &config, &mut codex_cache);
+        let status = build_status_line(&config, &codex_cache);
         Ok(Self {
             data_file,
             config_file,
             config,
             data,
             selected_provider: None,
-            status: "Ready".to_string(),
+            status,
             codex_cache,
+            show_help: false,
         }
         .with_selected_provider())
     }
@@ -63,11 +66,7 @@ impl App {
                 merge_codex_usage(&mut data, &self.config, &mut self.codex_cache);
                 self.data = data;
                 self.sync_selected_provider();
-                self.status = format!(
-                    "Reloaded data: {} | config: {}",
-                    self.data_file.display(),
-                    self.config_file.display()
-                );
+                self.status = build_status_line(&self.config, &self.codex_cache);
             }
             Err(err) => {
                 self.status = format!("Reload failed: {err}");
@@ -94,10 +93,10 @@ impl App {
             return;
         }
 
-        if let Some(selected) = self.selected_provider.as_ref() {
-            if providers.iter().any(|name| name == selected) {
-                return;
-            }
+        if let Some(selected) = self.selected_provider.as_ref()
+            && providers.iter().any(|name| name == selected)
+        {
+            return;
         }
         self.selected_provider = providers.first().cloned();
     }
@@ -137,18 +136,31 @@ impl App {
         };
         self.selected_provider = providers.get(prev).cloned();
     }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        self.status = if self.show_help {
+            "Help opened".to_string()
+        } else {
+            "Help closed".to_string()
+        };
+    }
 }
 
-pub(crate) fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
+pub(crate) fn run(
+    mut terminal: DefaultTerminal,
+    app: &mut App,
+    refresh_interval: Duration,
+) -> Result<()> {
     let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|frame| draw(frame, app))?;
 
         let elapsed = last_refresh.elapsed();
-        let timeout = if elapsed >= AUTO_REFRESH_INTERVAL {
+        let timeout = if elapsed >= refresh_interval {
             Duration::from_millis(0)
         } else {
-            AUTO_REFRESH_INTERVAL - elapsed
+            refresh_interval - elapsed
         };
 
         if event::poll(timeout)? {
@@ -176,12 +188,15 @@ pub(crate) fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     app.select_next_provider();
                     app.status = "Selected next provider".to_string();
                 }
+                Event::Key(key) if key.code == KeyCode::Char('?') => {
+                    app.toggle_help();
+                }
                 _ => {}
             }
             continue;
         }
 
-        if last_refresh.elapsed() >= AUTO_REFRESH_INTERVAL {
+        if last_refresh.elapsed() >= refresh_interval {
             app.reload();
             last_refresh = Instant::now();
         }
@@ -202,8 +217,37 @@ pub(crate) fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn bootstrap_app() -> Result<App> {
-    let data_file = default_data_file()?;
-    let config_file = default_config_file()?;
+pub(crate) fn bootstrap_app(
+    data_file: Option<PathBuf>,
+    config_file: Option<PathBuf>,
+) -> Result<App> {
+    let data_file = match data_file {
+        Some(path) => path,
+        None => default_data_file()?,
+    };
+    let config_file = match config_file {
+        Some(path) => path,
+        None => default_config_file()?,
+    };
     App::new(data_file, config_file)
+}
+
+fn build_status_line(config: &AppConfig, cache: &CodexImportCache) -> String {
+    if !config.codex_import.enabled {
+        return "Ready".to_string();
+    }
+    let diagnostics = codex_import_diagnostics(cache);
+    let imported_ago_secs = diagnostics
+        .last_import_at
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "Codex import files:{} refreshed:{} parse_fail:{} scan:{}s updated:{}s",
+        diagnostics.active_files,
+        diagnostics.refreshed_files,
+        diagnostics.parse_failures,
+        diagnostics.discovery_interval.as_secs(),
+        imported_ago_secs
+    )
 }

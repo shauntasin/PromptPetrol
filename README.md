@@ -19,10 +19,27 @@ PromptPetrol is a Rust TUI app for monitoring AI token usage like fuel usage.
 cargo run
 ```
 
+Optional flags:
+
+```bash
+cargo run -- \
+  --data-file /path/to/usage.json \
+  --config-file /path/to/config.json \
+  --refresh-interval-seconds 10
+```
+
+Export provider summaries without opening the TUI:
+
+```bash
+cargo run -- --export-json /tmp/promptpetrol-summary.json
+cargo run -- --export-csv /tmp/promptpetrol-summary.csv
+```
+
 ## Controls
 
 - `q`: quit
 - `r`: reload usage data and config from disk
+- `?`: toggle keyboard help panel
 
 ## Data file
 
@@ -93,3 +110,15 @@ When `codex_import.enabled` is true, PromptPetrol reads Codex session `.jsonl` f
 
 PromptPetrol uses the latest `token_count` totals found in each session file and adds them as `provider = "codex"` entries in the dashboard.
 It also shows Codex rate-limit usage in Alerts (5-hour and weekly) when available in session events.
+
+## Troubleshooting Codex import
+
+- Confirm `codex_import.enabled` is `true` in `config.json`.
+- If you use a non-default Codex sessions path, set `codex_import.sessions_dir`.
+- If limits/usage look stale, press `r` to force a reload and check the Info line for:
+  - files discovered,
+  - refreshed session files,
+  - parse failures,
+  - current scan interval.
+- Parse failures usually indicate malformed or partial `.jsonl` lines; PromptPetrol ignores bad lines but counts failed files in diagnostics.
+- Discovery scans back off when no files change, then reset to fast scan when activity resumes. Use `--refresh-interval-seconds` to tune UI refresh cadence.

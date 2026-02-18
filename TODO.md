@@ -22,11 +22,11 @@
 
 - [x] Split `src/main.rs` into modules (`app`, `ui`, `codex_import`, `models`) to reduce coupling and improve testability
 - [x] Add integration tests for Codex session import using fixture `.jsonl` files (including malformed lines and mixed event types)
-- [ ] Add a large-session performance pass (benchmark + optimize recursive scan of `~/.codex/sessions`)
-- [ ] Add optional debounce/backoff for auto-refresh when no files changed for extended periods
-- [ ] Surface Codex import diagnostics in the UI status line (sessions read, parse failures, last import time)
-- [ ] Add keyboard shortcut help panel in-app (toggle with `?`)
-- [ ] Add CLI flags for `--data-file`, `--config-file`, and `--refresh-interval-seconds`
-- [ ] Add export command for provider summaries (`json` and `csv`)
-- [ ] Add CI workflow for `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`
-- [ ] Expand README with troubleshooting for Codex import paths, permissions, and stale session data
+- [x] Add a large-session performance pass (benchmark + optimize recursive scan of `~/.codex/sessions`)
+- [x] Add optional debounce/backoff for auto-refresh when no files changed for extended periods
+- [x] Surface Codex import diagnostics in the UI status line (sessions read, parse failures, last import time)
+- [x] Add keyboard shortcut help panel in-app (toggle with `?`)
+- [x] Add CLI flags for `--data-file`, `--config-file`, and `--refresh-interval-seconds`
+- [x] Add export command for provider summaries (`json` and `csv`)
+- [x] Add CI workflow for `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`
+- [x] Expand README with troubleshooting for Codex import paths, permissions, and stale session data

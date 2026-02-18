@@ -174,7 +174,7 @@ struct RawUsageEntry {
     cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProviderSummary {
     pub(crate) provider: String,
     pub(crate) total_tokens: u64,
@@ -416,11 +416,12 @@ fn adapt_generic_tokens(raw: &RawUsageEntry) -> (u64, u64) {
 }
 
 fn split_with_total(input: u64, output: u64, total: Option<u64>) -> (u64, u64) {
-    if input == 0 && output == 0 {
-        if let Some(total) = total {
-            let input_guess = total / 2;
-            return (input_guess, total - input_guess);
-        }
+    if input == 0
+        && output == 0
+        && let Some(total) = total
+    {
+        let input_guess = total / 2;
+        return (input_guess, total - input_guess);
     }
 
     if let Some(total) = total {
