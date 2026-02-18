@@ -883,6 +883,7 @@ fn normalize_raw_usage(raw: RawUsageData, config: &AppConfig) -> UsageData {
 #[derive(Debug, Clone)]
 struct CachedCodexSession {
     modified: SystemTime,
+    file_len: u64,
     timestamp: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -922,22 +923,25 @@ fn merge_codex_usage(data: &mut UsageData, config: &AppConfig, cache: &mut Codex
     let mut active = HashSet::new();
     for file in session_files {
         active.insert(file.clone());
-        let modified = match fs::metadata(&file).and_then(|m| m.modified()) {
-            Ok(modified) => modified,
+        let (modified, file_len) = match fs::metadata(&file) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) => (modified, metadata.len()),
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
 
         let needs_refresh = cache
             .sessions
             .get(&file)
-            .map(|cached| cached.modified != modified)
+            .map(|cached| cached.modified != modified || cached.file_len != file_len)
             .unwrap_or(true);
 
         if !needs_refresh {
             continue;
         }
 
-        if let Some(parsed) = parse_codex_session_file(&file, modified) {
+        if let Some(parsed) = parse_codex_session_file(&file, modified, file_len) {
             cache.sessions.insert(file, parsed);
         } else {
             cache.sessions.remove(&file);
@@ -1009,12 +1013,17 @@ fn collect_jsonl_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Re
     Ok(())
 }
 
-fn parse_codex_session_file(path: &Path, modified: SystemTime) -> Option<CachedCodexSession> {
+fn parse_codex_session_file(
+    path: &Path,
+    modified: SystemTime,
+    file_len: u64,
+) -> Option<CachedCodexSession> {
     let contents = fs::read_to_string(path).ok()?;
     let (timestamp, input_tokens, output_tokens, has_token_usage, limits) =
         parse_codex_session_contents(&contents)?;
     Some(CachedCodexSession {
         modified,
+        file_len,
         timestamp,
         input_tokens,
         output_tokens,
@@ -1118,9 +1127,14 @@ fn latest_codex_limits(cache: &CodexImportCache) -> Option<CodexRateLimits> {
     cache
         .sessions
         .values()
-        .filter_map(|s| s.limits.as_ref())
-        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
-        .cloned()
+        .filter_map(|session| {
+            session
+                .limits
+                .as_ref()
+                .map(|limits| (session.modified, &limits.timestamp, limits))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .map(|(_, _, limits)| limits.clone())
 }
 
 fn normalize_entry(raw: RawUsageEntry, config: &AppConfig) -> UsageEntry {
@@ -1379,5 +1393,57 @@ mod tests {
         let limits = parsed.4.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 3.0);
         assert_eq!(limits.secondary.expect("secondary").used_percent, 2.0);
+    }
+
+    #[test]
+    fn latest_codex_limits_prefers_newest_session_file() {
+        let mut cache = CodexImportCache::default();
+        let older = UNIX_EPOCH + Duration::from_secs(100);
+        let newer = UNIX_EPOCH + Duration::from_secs(200);
+
+        cache.sessions.insert(
+            PathBuf::from("older.jsonl"),
+            CachedCodexSession {
+                modified: older,
+                file_len: 100,
+                timestamp: "2026-02-18T00:00:00Z".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                has_token_usage: false,
+                limits: Some(CodexRateLimits {
+                    timestamp: "2026-02-18T00:00:00Z".to_string(),
+                    primary: Some(CodexRateLimit {
+                        used_percent: 12.0,
+                        window_minutes: 300,
+                        resets_at: None,
+                    }),
+                    secondary: None,
+                }),
+            },
+        );
+
+        cache.sessions.insert(
+            PathBuf::from("newer.jsonl"),
+            CachedCodexSession {
+                modified: newer,
+                file_len: 110,
+                timestamp: "2026-02-17T23:59:59Z".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                has_token_usage: false,
+                limits: Some(CodexRateLimits {
+                    timestamp: "2026-02-17T23:59:59Z".to_string(),
+                    primary: Some(CodexRateLimit {
+                        used_percent: 4.0,
+                        window_minutes: 300,
+                        resets_at: None,
+                    }),
+                    secondary: None,
+                }),
+            },
+        );
+
+        let limits = latest_codex_limits(&cache).expect("expected limits");
+        assert_eq!(limits.primary.expect("primary").used_percent, 4.0);
     }
 }
