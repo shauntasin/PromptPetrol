@@ -1,0 +1,6 @@
+{"timestamp":"2026-02-18T10:00:00.000Z","type":"session_meta","payload":{"timestamp":"2026-02-18T10:00:00.000Z"}}
+this is not json
+{"timestamp":"2026-02-18T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+{"timestamp":"2026-02-18T10:00:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}},"rate_limits":{"primary":{"used_percent":2.0,"window_minutes":300,"resets_at":1771431686},"secondary":{"used_percent":1.0,"window_minutes":10080,"resets_at":1771922246}}}}
+{"timestamp":"2026-02-18T10:00:20.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-02-18T10:01:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"output_tokens":55}},"rate_limits":{"primary":{"used_percent":5.0,"window_minutes":300,"resets_at":1771431686},"secondary":{"used_percent":3.0,"window_minutes":10080,"resets_at":1771922246}}}}
