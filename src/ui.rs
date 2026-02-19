@@ -8,7 +8,9 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::App;
-use crate::codex_import::{CodexRateLimit, CodexRateLimits, latest_codex_limits};
+use crate::codex_import::{
+    CodexRateLimit, CodexRateLimits, codex_import_diagnostics, latest_codex_limits,
+};
 use crate::models::{provider_stats, provider_summaries};
 
 const APP_NAME: &str = "PromptPetrol";
@@ -81,6 +83,14 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     } else {
         None
     };
+    let codex_import_age_secs = if is_codex {
+        codex_import_diagnostics(&app.codex_cache)
+            .last_import_at
+            .and_then(|timestamp| SystemTime::now().duration_since(timestamp).ok())
+            .map(|duration| duration.as_secs())
+    } else {
+        None
+    };
 
     let basic_line = if let Some(provider) = selected_stats.as_ref() {
         if is_codex {
@@ -106,7 +116,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         format!("{basic_line} | {}", app.status)
     };
     let alert_lines = if is_codex {
-        build_codex_alert_lines(codex_limits.as_ref())
+        build_codex_alert_lines(codex_limits.as_ref(), codex_import_age_secs)
     } else {
         build_alert_lines(fuel_ratio, token_ratio, spend_ratio, activity_ratio)
     };
@@ -301,18 +311,63 @@ fn alert_line(label: &str, alert: bool, ratio: f64, low_is_bad: bool) -> Line<'s
     ])
 }
 
-fn build_codex_alert_lines(limits: Option<&CodexRateLimits>) -> Vec<Line<'static>> {
+fn build_codex_alert_lines(
+    limits: Option<&CodexRateLimits>,
+    import_age_secs: Option<u64>,
+) -> Vec<Line<'static>> {
     let Some(limits) = limits else {
-        return vec![Line::from(Span::styled(
-            " Codex rate limits unavailable ",
-            Style::default().fg(Color::Yellow),
-        ))];
+        return vec![
+            Line::from(Span::styled(
+                " Codex rate limits unavailable ",
+                Style::default().fg(Color::Yellow),
+            )),
+            codex_freshness_line(import_age_secs),
+        ];
     };
 
     vec![
         codex_alert_line("5H LIMIT", limits.primary.as_ref()),
         codex_alert_line("WEEKLY", limits.secondary.as_ref()),
+        codex_freshness_line(import_age_secs),
     ]
+}
+
+fn codex_freshness_line(import_age_secs: Option<u64>) -> Line<'static> {
+    let Some(age_secs) = import_age_secs else {
+        return Line::from(vec![
+            Span::styled(" FRESHNESS ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                " UNKNOWN ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    };
+
+    let (state, color) = if age_secs <= 30 {
+        ("LIVE", Color::Green)
+    } else if age_secs <= 120 {
+        ("STALE", Color::Yellow)
+    } else {
+        ("OLD", Color::Red)
+    };
+
+    Line::from(vec![
+        Span::styled(" FRESHNESS ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!(" {:<7} ", state),
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" updated {age_secs}s ago"),
+            Style::default().fg(Color::Cyan),
+        ),
+    ])
 }
 
 fn codex_alert_line(label: &str, limit: Option<&CodexRateLimit>) -> Line<'static> {

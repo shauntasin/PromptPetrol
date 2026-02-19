@@ -27,7 +27,9 @@ struct CachedCodexSession {
 pub(crate) struct CodexImportDiagnostics {
     pub(crate) active_files: usize,
     pub(crate) refreshed_files: usize,
-    pub(crate) parse_failures: usize,
+    pub(crate) parse_error_files: usize,
+    pub(crate) no_usage_or_limits_files: usize,
+    pub(crate) unreadable_files: usize,
     pub(crate) last_import_at: Option<SystemTime>,
     pub(crate) discovery_interval: Duration,
 }
@@ -37,11 +39,26 @@ impl Default for CodexImportDiagnostics {
         Self {
             active_files: 0,
             refreshed_files: 0,
-            parse_failures: 0,
+            parse_error_files: 0,
+            no_usage_or_limits_files: 0,
+            unreadable_files: 0,
             last_import_at: None,
             discovery_interval: MIN_DISCOVERY_INTERVAL,
         }
     }
+}
+
+enum ParsedSessionFile {
+    Parsed(CachedCodexSession),
+    NoUsageOrLimits,
+    ParseError,
+    Unreadable,
+}
+
+enum ParsedSessionContents {
+    Parsed((String, u64, u64, bool, Option<CodexRateLimits>)),
+    NoUsageOrLimits,
+    ParseError,
 }
 
 #[derive(Debug, Clone)]
@@ -103,20 +120,27 @@ pub(crate) fn merge_codex_usage(
 
     let mut active = HashSet::new();
     let mut refreshed_files = 0_usize;
-    let mut parse_failures = 0_usize;
+    let mut parse_error_files = 0_usize;
+    let mut no_usage_or_limits_files = 0_usize;
+    let mut unreadable_files = 0_usize;
     for file in &cache.session_files {
+        active.insert(file.clone());
         let (modified, file_len) = match fs::metadata(file) {
             Ok(metadata) => match metadata.modified() {
                 Ok(modified) => (modified, metadata.len()),
-                Err(_) => continue,
+                Err(_) => {
+                    unreadable_files += 1;
+                    cache.sessions.remove(file);
+                    continue;
+                }
             },
             Err(_) => {
                 changes_detected = true;
+                unreadable_files += 1;
                 cache.sessions.remove(file);
                 continue;
             }
         };
-        active.insert(file.clone());
 
         let needs_refresh = cache
             .sessions
@@ -130,11 +154,22 @@ pub(crate) fn merge_codex_usage(
         changes_detected = true;
         refreshed_files += 1;
 
-        if let Some(parsed) = parse_codex_session_file(file, modified, file_len) {
-            cache.sessions.insert(file.clone(), parsed);
-        } else {
-            parse_failures += 1;
-            cache.sessions.remove(file);
+        match parse_codex_session_file(file, modified, file_len) {
+            ParsedSessionFile::Parsed(parsed) => {
+                cache.sessions.insert(file.clone(), parsed);
+            }
+            ParsedSessionFile::NoUsageOrLimits => {
+                no_usage_or_limits_files += 1;
+                cache.sessions.remove(file);
+            }
+            ParsedSessionFile::ParseError => {
+                parse_error_files += 1;
+                cache.sessions.remove(file);
+            }
+            ParsedSessionFile::Unreadable => {
+                unreadable_files += 1;
+                cache.sessions.remove(file);
+            }
         }
     }
 
@@ -146,7 +181,9 @@ pub(crate) fn merge_codex_usage(
     cache.diagnostics = CodexImportDiagnostics {
         active_files: active.len(),
         refreshed_files,
-        parse_failures,
+        parse_error_files,
+        no_usage_or_limits_files,
+        unreadable_files,
         last_import_at: Some(SystemTime::now()),
         discovery_interval: cache.session_discovery_interval,
     };
@@ -259,28 +296,44 @@ fn collect_jsonl_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Re
     Ok(())
 }
 
-fn parse_codex_session_file(
-    path: &Path,
-    modified: SystemTime,
-    file_len: u64,
-) -> Option<CachedCodexSession> {
-    let contents = fs::read_to_string(path).ok()?;
-    let (timestamp, input_tokens, output_tokens, has_token_usage, limits) =
-        parse_codex_session_contents(&contents)?;
-    Some(CachedCodexSession {
-        modified,
-        file_len,
-        timestamp,
-        input_tokens,
-        output_tokens,
-        has_token_usage,
-        limits,
-    })
+fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) -> ParsedSessionFile {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return ParsedSessionFile::Unreadable,
+    };
+
+    match parse_codex_session_contents_with_status(&contents) {
+        ParsedSessionContents::Parsed((
+            timestamp,
+            input_tokens,
+            output_tokens,
+            has_token_usage,
+            limits,
+        )) => ParsedSessionFile::Parsed(CachedCodexSession {
+            modified,
+            file_len,
+            timestamp,
+            input_tokens,
+            output_tokens,
+            has_token_usage,
+            limits,
+        }),
+        ParsedSessionContents::NoUsageOrLimits => ParsedSessionFile::NoUsageOrLimits,
+        ParsedSessionContents::ParseError => ParsedSessionFile::ParseError,
+    }
 }
 
 fn parse_codex_session_contents(
     contents: &str,
 ) -> Option<(String, u64, u64, bool, Option<CodexRateLimits>)> {
+    match parse_codex_session_contents_with_status(contents) {
+        ParsedSessionContents::Parsed(parsed) => Some(parsed),
+        ParsedSessionContents::NoUsageOrLimits | ParsedSessionContents::ParseError => None,
+    }
+}
+
+fn parse_codex_session_contents_with_status(contents: &str) -> ParsedSessionContents {
+    let mut parsed_json_lines = 0_usize;
     let mut session_timestamp: Option<String> = None;
     let mut latest_event_timestamp: Option<String> = None;
     let mut input_tokens: u64 = 0;
@@ -292,6 +345,7 @@ fn parse_codex_session_contents(
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        parsed_json_lines += 1;
 
         if v.get("type").and_then(Value::as_str) == Some("session_meta")
             && let Some(ts) = v.pointer("/payload/timestamp").and_then(Value::as_str)
@@ -337,11 +391,20 @@ fn parse_codex_session_contents(
         }
     }
 
-    let timestamp = latest_event_timestamp.or(session_timestamp)?;
-    if !has_token_usage && latest_limits.is_none() {
-        return None;
+    if parsed_json_lines == 0 {
+        return ParsedSessionContents::ParseError;
     }
-    Some((
+
+    let timestamp = match latest_event_timestamp.or(session_timestamp) {
+        Some(timestamp) => timestamp,
+        None => return ParsedSessionContents::NoUsageOrLimits,
+    };
+
+    if !has_token_usage && latest_limits.is_none() {
+        return ParsedSessionContents::NoUsageOrLimits;
+    }
+
+    ParsedSessionContents::Parsed((
         timestamp,
         input_tokens,
         output_tokens,
@@ -522,7 +585,9 @@ mod tests {
         let diagnostics = codex_import_diagnostics(&cache);
         assert_eq!(diagnostics.active_files, 3);
         assert_eq!(diagnostics.refreshed_files, 3);
-        assert_eq!(diagnostics.parse_failures, 1);
+        assert_eq!(diagnostics.parse_error_files, 0);
+        assert_eq!(diagnostics.no_usage_or_limits_files, 1);
+        assert_eq!(diagnostics.unreadable_files, 0);
         assert_eq!(diagnostics.discovery_interval, MIN_DISCOVERY_INTERVAL);
         assert!(diagnostics.last_import_at.is_some());
 
@@ -591,6 +656,23 @@ mod tests {
         assert_eq!(cache.session_discovery_interval, MIN_DISCOVERY_INTERVAL);
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn parser_classifies_malformed_only_payload_as_parse_error() {
+        let payload = "not-json\nthis is also invalid\n";
+        let classification = parse_codex_session_contents_with_status(payload);
+        assert!(matches!(classification, ParsedSessionContents::ParseError));
+    }
+
+    #[test]
+    fn parser_classifies_valid_non_usage_payload_as_no_usage_or_limits() {
+        let payload = "{\"timestamp\":\"2026-02-16T09:45:42.927Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}";
+        let classification = parse_codex_session_contents_with_status(payload);
+        assert!(matches!(
+            classification,
+            ParsedSessionContents::NoUsageOrLimits
+        ));
     }
 
     fn fixture_contents(name: &str) -> String {

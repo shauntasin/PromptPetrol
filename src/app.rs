@@ -243,10 +243,12 @@ fn build_status_line(config: &AppConfig, cache: &CodexImportCache) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!(
-        "Codex import files:{} refreshed:{} parse_fail:{} scan:{}s updated:{}s",
+        "Codex import files:{} refreshed:{} parse:{} no_usage:{} unreadable:{} scan:{}s updated:{}s",
         diagnostics.active_files,
         diagnostics.refreshed_files,
-        diagnostics.parse_failures,
+        diagnostics.parse_error_files,
+        diagnostics.no_usage_or_limits_files,
+        diagnostics.unreadable_files,
         diagnostics.discovery_interval.as_secs(),
         imported_ago_secs
     )
