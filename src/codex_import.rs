@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -297,12 +298,13 @@ fn collect_jsonl_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Re
 }
 
 fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) -> ParsedSessionFile {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(_) => return ParsedSessionFile::Unreadable,
     };
+    let reader = BufReader::new(file);
 
-    match parse_codex_session_contents_with_status(&contents) {
+    match parse_codex_session_reader(reader) {
         ParsedSessionContents::Parsed((
             timestamp,
             input_tokens,
@@ -333,6 +335,10 @@ fn parse_codex_session_contents(
 }
 
 fn parse_codex_session_contents_with_status(contents: &str) -> ParsedSessionContents {
+    parse_codex_session_reader(Cursor::new(contents.as_bytes()))
+}
+
+fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContents {
     let mut parsed_json_lines = 0_usize;
     let mut session_timestamp: Option<String> = None;
     let mut latest_event_timestamp: Option<String> = None;
@@ -340,8 +346,23 @@ fn parse_codex_session_contents_with_status(contents: &str) -> ParsedSessionCont
     let mut output_tokens: u64 = 0;
     let mut has_token_usage = false;
     let mut latest_limits: Option<CodexRateLimits> = None;
+    let mut line = String::new();
 
-    for line in contents.lines() {
+    loop {
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(count) => count,
+            Err(_) => return ParsedSessionContents::ParseError,
+        };
+        if bytes_read == 0 {
+            break;
+        }
+
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.is_empty() {
+            continue;
+        }
+
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
