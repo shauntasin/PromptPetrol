@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
+use serde::Deserialize;
 
 use crate::models::{AppConfig, UsageData, UsageEntry, estimate_cost_usd};
 
@@ -60,6 +60,92 @@ enum ParsedSessionContents {
     Parsed((String, u64, u64, bool, Option<CodexRateLimits>)),
     NoUsageOrLimits,
     ParseError,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexEventEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    payload: Option<CodexEventPayloadEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexEventPayloadEnvelope {
+    #[serde(rename = "type", default)]
+    payload_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexSessionMetaEvent {
+    #[serde(default)]
+    payload: Option<CodexSessionMetaPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexSessionMetaPayload {
+    #[serde(default)]
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenCountEvent {
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    payload: Option<CodexTokenCountPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenCountPayload {
+    #[serde(default)]
+    info: Option<CodexTokenInfo>,
+    #[serde(default)]
+    rate_limits: Option<CodexEventRateLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenInfo {
+    #[serde(default)]
+    total_token_usage: Option<CodexTotalTokenUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTotalTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexEventRateLimits {
+    #[serde(default)]
+    primary: Option<CodexRawRateLimit>,
+    #[serde(default)]
+    secondary: Option<CodexRawRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRawRateLimit {
+    used_percent: CodexRateLimitPercent,
+    window_minutes: u64,
+    #[serde(default)]
+    resets_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CodexRateLimitPercent {
+    Float(f64),
+    Int(u64),
+}
+
+impl CodexRateLimitPercent {
+    fn as_f64(&self) -> f64 {
+        match self {
+            Self::Float(value) => *value,
+            Self::Int(value) => *value as f64,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -363,32 +449,55 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             continue;
         }
 
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+        let Ok(envelope) = serde_json::from_str::<CodexEventEnvelope>(line) else {
             continue;
         };
         parsed_json_lines += 1;
 
-        if v.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(ts) = v.pointer("/payload/timestamp").and_then(Value::as_str)
-        {
-            session_timestamp = Some(ts.to_string());
-        }
+        let is_token_count = envelope.event_type == "event_msg"
+            && envelope
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.payload_type.as_deref())
+                == Some("token_count");
 
-        let is_token_count = v.get("type").and_then(Value::as_str) == Some("event_msg")
-            && v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count");
+        if envelope.event_type == "session_meta" {
+            let Ok(event) = serde_json::from_str::<CodexSessionMetaEvent>(line) else {
+                continue;
+            };
+            if let Some(ts) = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.timestamp.as_ref())
+            {
+                session_timestamp = Some(ts.clone());
+            }
+            continue;
+        }
 
         if !is_token_count {
             continue;
         }
 
-        let event_timestamp = v
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let Ok(event) = serde_json::from_str::<CodexTokenCountEvent>(line) else {
+            continue;
+        };
+
+        let event_timestamp = event.timestamp.clone();
         if let Some(ts) = event_timestamp.as_ref() {
             latest_event_timestamp = Some(ts.clone());
-            let primary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/primary"));
-            let secondary = parse_codex_rate_limit(v.pointer("/payload/rate_limits/secondary"));
+            let primary = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.rate_limits.as_ref())
+                .and_then(|limits| limits.primary.as_ref())
+                .map(parse_codex_rate_limit);
+            let secondary = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.rate_limits.as_ref())
+                .and_then(|limits| limits.secondary.as_ref())
+                .map(parse_codex_rate_limit);
             if primary.is_some() || secondary.is_some() {
                 latest_limits = Some(CodexRateLimits {
                     timestamp: ts.clone(),
@@ -398,16 +507,15 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             }
         }
 
-        let maybe_input = v
-            .pointer("/payload/info/total_token_usage/input_tokens")
-            .and_then(Value::as_u64);
-        let maybe_output = v
-            .pointer("/payload/info/total_token_usage/output_tokens")
-            .and_then(Value::as_u64);
+        let maybe_total_usage = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.info.as_ref())
+            .and_then(|info| info.total_token_usage.as_ref());
 
-        if let (Some(input), Some(output)) = (maybe_input, maybe_output) {
-            input_tokens = input;
-            output_tokens = output;
+        if let Some(total_usage) = maybe_total_usage {
+            input_tokens = total_usage.input_tokens;
+            output_tokens = total_usage.output_tokens;
             has_token_usage = true;
         }
     }
@@ -434,23 +542,12 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
     ))
 }
 
-fn parse_codex_rate_limit(node: Option<&Value>) -> Option<CodexRateLimit> {
-    let node = node?;
-    let used_percent = node
-        .get("used_percent")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            node.get("used_percent")
-                .and_then(Value::as_u64)
-                .map(|v| v as f64)
-        })?;
-    let window_minutes = node.get("window_minutes").and_then(Value::as_u64)?;
-    let resets_at = node.get("resets_at").and_then(Value::as_u64);
-    Some(CodexRateLimit {
-        used_percent,
-        window_minutes,
-        resets_at,
-    })
+fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> CodexRateLimit {
+    CodexRateLimit {
+        used_percent: node.used_percent.as_f64(),
+        window_minutes: node.window_minutes,
+        resets_at: node.resets_at,
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +580,14 @@ mod tests {
         let limits = parsed.4.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").window_minutes, 300);
         assert_eq!(limits.secondary.expect("secondary").window_minutes, 10080);
+    }
+
+    #[test]
+    fn parses_codex_rate_limits_with_integer_percent() {
+        let payload = r#"{"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":20}},"rate_limits":{"primary":{"used_percent":7,"window_minutes":300,"resets_at":1771243734}}}}"#;
+        let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
+        let limits = parsed.4.expect("expected limits");
+        assert_eq!(limits.primary.expect("primary").used_percent, 7.0);
     }
 
     #[test]

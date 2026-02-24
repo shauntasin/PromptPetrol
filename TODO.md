@@ -42,8 +42,8 @@
 ### P1 - Parsing performance
 
 - [x] Replace full-file `read_to_string` with streaming JSONL parsing (`BufRead`)
-- [ ] Introduce typed partial structs for Codex events instead of generic `serde_json::Value`
-- [ ] Parse only relevant event types quickly (`session_meta`, `event_msg/token_count`)
+- [x] Introduce typed partial structs for Codex events instead of generic `serde_json::Value`
+- [x] Parse only relevant event types quickly (`session_meta`, `event_msg/token_count`)
 - [ ] Add benchmarks for 10k+ files and very large session files
 
 ### P2 - Incremental ingest architecture
