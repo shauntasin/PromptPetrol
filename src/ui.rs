@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -21,12 +22,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Min(8),
-        ])
+        .constraints([Constraint::Length(8), Constraint::Min(8)])
         .split(area);
+    let top_panels = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(chunks[0]);
 
     let selected_provider = app.selected_provider.as_deref().unwrap_or("");
     let selected_stats = provider_stats(&app.data, selected_provider);
@@ -121,19 +122,28 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         build_alert_lines(fuel_ratio, token_ratio, spend_ratio, activity_ratio)
     };
     frame.render_widget(
-        Paragraph::new(info_line).block(Block::default().borders(Borders::ALL).title("Info")),
-        chunks[0],
+        Paragraph::new(info_line).block(rounded_block("Info")),
+        top_panels[0],
     );
     frame.render_widget(
-        Paragraph::new(alert_lines).block(Block::default().borders(Borders::ALL).title("Alerts")),
-        chunks[1],
+        Paragraph::new(alert_lines).block(rounded_block("Alerts")),
+        top_panels[1],
     );
+
+    let gauge_block_title = if is_codex {
+        "Codex Limit Dials"
+    } else {
+        "Usage Dials"
+    };
+    let gauge_block = rounded_block(gauge_block_title);
+    let gauge_inner = gauge_block.inner(chunks[1]);
+    frame.render_widget(gauge_block, chunks[1]);
 
     if is_codex {
         let codex_gauges = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[2]);
+            .split(gauge_inner);
         let five_hour_ratio = codex_limits
             .as_ref()
             .and_then(|limits| limits.primary.as_ref())
@@ -150,7 +160,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         let gauge_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[2]);
+            .split(gauge_inner);
         let top_gauges = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -180,7 +190,7 @@ fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f6
     } else {
         Color::Cyan
     };
-    let dial_block = Block::default().borders(Borders::ALL).title(title);
+    let dial_block = rounded_block(title);
 
     frame.render_widget(
         Canvas::default()
@@ -449,13 +459,16 @@ fn draw_help_overlay(frame: &mut Frame<'_>) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(help_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Keyboard Help"),
-        ),
+        Paragraph::new(help_lines).block(rounded_block("Keyboard Help")),
         area,
     );
+}
+
+fn rounded_block<'a>(title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .title(title)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

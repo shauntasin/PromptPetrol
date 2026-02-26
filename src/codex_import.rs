@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -63,41 +63,21 @@ enum ParsedSessionContents {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexEventEnvelope {
+struct CodexSessionLine {
+    #[serde(default)]
+    timestamp: Option<String>,
     #[serde(rename = "type")]
     event_type: String,
     #[serde(default)]
-    payload: Option<CodexEventPayloadEnvelope>,
+    payload: Option<CodexSessionLinePayload>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexEventPayloadEnvelope {
+struct CodexSessionLinePayload {
     #[serde(rename = "type", default)]
     payload_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexSessionMetaEvent {
-    #[serde(default)]
-    payload: Option<CodexSessionMetaPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexSessionMetaPayload {
     #[serde(default)]
     timestamp: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexTokenCountEvent {
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(default)]
-    payload: Option<CodexTokenCountPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexTokenCountPayload {
     #[serde(default)]
     info: Option<CodexTokenInfo>,
     #[serde(default)]
@@ -165,6 +145,7 @@ pub(crate) struct CodexRateLimits {
 #[derive(Debug)]
 pub(crate) struct CodexImportCache {
     sessions: HashMap<PathBuf, CachedCodexSession>,
+    latest_limits: Option<CodexRateLimits>,
     session_files: Vec<PathBuf>,
     last_discovery_at: Option<SystemTime>,
     session_discovery_interval: Duration,
@@ -176,6 +157,7 @@ impl Default for CodexImportCache {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            latest_limits: None,
             session_files: Vec::new(),
             last_discovery_at: None,
             session_discovery_interval: MIN_DISCOVERY_INTERVAL,
@@ -262,6 +244,7 @@ pub(crate) fn merge_codex_usage(
 
     cache.sessions.retain(|path, _| active.contains(path));
     cache.session_files.retain(|path| active.contains(path));
+    cache.latest_limits = find_latest_limits(&cache.sessions);
     if discovery_ran {
         tune_discovery_interval(cache, changes_detected);
     }
@@ -331,16 +314,9 @@ fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool)
 
 pub(crate) fn latest_codex_limits(cache: &CodexImportCache) -> Option<CodexRateLimits> {
     cache
-        .sessions
-        .values()
-        .filter_map(|session| {
-            session
-                .limits
-                .as_ref()
-                .map(|limits| (session.modified, &limits.timestamp, limits))
-        })
-        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
-        .map(|(_, _, limits)| limits.clone())
+        .latest_limits
+        .clone()
+        .or_else(|| find_latest_limits(&cache.sessions))
 }
 
 pub(crate) fn codex_import_diagnostics(cache: &CodexImportCache) -> CodexImportDiagnostics {
@@ -449,65 +425,67 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             continue;
         }
 
-        let Ok(envelope) = serde_json::from_str::<CodexEventEnvelope>(line) else {
+        let Ok(parsed_line) = serde_json::from_str::<CodexSessionLine>(line) else {
             continue;
         };
         parsed_json_lines += 1;
 
-        let is_token_count = envelope.event_type == "event_msg"
-            && envelope
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.payload_type.as_deref())
-                == Some("token_count");
-
-        if envelope.event_type == "session_meta" {
-            let Ok(event) = serde_json::from_str::<CodexSessionMetaEvent>(line) else {
-                continue;
-            };
-            if let Some(ts) = event
+        if parsed_line.event_type == "session_meta" {
+            let meta_timestamp = parsed_line
                 .payload
                 .as_ref()
                 .and_then(|payload| payload.timestamp.as_ref())
-            {
+                .or(parsed_line.timestamp.as_ref());
+            if let Some(ts) = meta_timestamp {
                 session_timestamp = Some(ts.clone());
             }
             continue;
         }
 
+        let is_token_count = parsed_line.event_type == "event_msg"
+            && parsed_line
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.payload_type.as_deref())
+                == Some("token_count");
         if !is_token_count {
             continue;
         }
 
-        let Ok(event) = serde_json::from_str::<CodexTokenCountEvent>(line) else {
-            continue;
-        };
-
-        let event_timestamp = event.timestamp.clone();
-        if let Some(ts) = event_timestamp.as_ref() {
+        let event_timestamp = parsed_line.timestamp.as_ref().or(parsed_line
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.timestamp.as_ref()));
+        if let Some(ts) = event_timestamp {
             latest_event_timestamp = Some(ts.clone());
-            let primary = event
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.rate_limits.as_ref())
-                .and_then(|limits| limits.primary.as_ref())
-                .map(parse_codex_rate_limit);
-            let secondary = event
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.rate_limits.as_ref())
-                .and_then(|limits| limits.secondary.as_ref())
-                .map(parse_codex_rate_limit);
-            if primary.is_some() || secondary.is_some() {
-                latest_limits = Some(CodexRateLimits {
-                    timestamp: ts.clone(),
-                    primary,
-                    secondary,
-                });
-            }
         }
 
-        let maybe_total_usage = event
+        let primary = parsed_line
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.rate_limits.as_ref())
+            .and_then(|limits| limits.primary.as_ref())
+            .map(parse_codex_rate_limit);
+        let secondary = parsed_line
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.rate_limits.as_ref())
+            .and_then(|limits| limits.secondary.as_ref())
+            .map(parse_codex_rate_limit);
+        if primary.is_some() || secondary.is_some() {
+            let limit_timestamp = event_timestamp
+                .cloned()
+                .or_else(|| latest_event_timestamp.clone())
+                .or_else(|| session_timestamp.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            latest_limits = Some(CodexRateLimits {
+                timestamp: limit_timestamp,
+                primary,
+                secondary,
+            });
+        }
+
+        let maybe_total_usage = parsed_line
             .payload
             .as_ref()
             .and_then(|payload| payload.info.as_ref())
@@ -548,6 +526,19 @@ fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> CodexRateLimit {
         window_minutes: node.window_minutes,
         resets_at: node.resets_at,
     }
+}
+
+fn find_latest_limits(sessions: &HashMap<PathBuf, CachedCodexSession>) -> Option<CodexRateLimits> {
+    sessions
+        .values()
+        .filter_map(|session| {
+            session
+                .limits
+                .as_ref()
+                .map(|limits| (session.modified, &limits.timestamp, limits))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .map(|(_, _, limits)| limits.clone())
 }
 
 #[cfg(test)]
@@ -606,6 +597,16 @@ mod tests {
         let limits = parsed.4.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 3.0);
         assert_eq!(limits.secondary.expect("secondary").used_percent, 2.0);
+    }
+
+    #[test]
+    fn parses_rate_limits_without_event_timestamp_using_session_meta_timestamp() {
+        let payload = r#"{"timestamp":"2026-02-17T13:47:00.000Z","type":"session_meta","payload":{"timestamp":"2026-02-17T13:47:00.000Z"}}
+{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":6.0,"window_minutes":300,"resets_at":1771348283}}}}"#;
+        let parsed = parse_codex_session_contents(payload).expect("expected codex limits");
+        assert_eq!(parsed.0, "2026-02-17T13:47:00.000Z");
+        let limits = parsed.4.expect("expected limits");
+        assert_eq!(limits.primary.expect("primary").used_percent, 6.0);
     }
 
     #[test]
