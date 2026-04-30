@@ -10,6 +10,7 @@ use crossterm::terminal::{
 };
 use ratatui::DefaultTerminal;
 
+use crate::claude_import::{merge_claude_usage, ClaudeImportDiagnostics};
 use crate::codex_import::{CodexImportCache, codex_import_diagnostics, merge_codex_usage};
 use crate::models::{
     AppConfig, UsageData, default_config_file, default_data_file, load_or_bootstrap_config,
@@ -27,6 +28,7 @@ pub(crate) struct App {
     pub(crate) selected_provider: Option<String>,
     pub(crate) status: String,
     pub(crate) codex_cache: CodexImportCache,
+    pub(crate) claude_cache: ClaudeImportDiagnostics,
     pub(crate) show_help: bool,
 }
 
@@ -36,7 +38,13 @@ impl App {
         let mut data = load_or_bootstrap_data(&data_file, &config)?;
         let mut codex_cache = CodexImportCache::default();
         merge_codex_usage(&mut data, &config, &mut codex_cache);
-        let status = build_status_line(&config, &codex_cache);
+        
+        let mut claude_cache = ClaudeImportDiagnostics::default();
+        if config.claude_oauth_token.is_some() {
+            merge_claude_usage(&mut data, &config, &mut claude_cache);
+        }
+        
+        let status = build_status_line(&config, &codex_cache, &claude_cache);
         Ok(Self {
             data_file,
             config_file,
@@ -45,6 +53,7 @@ impl App {
             selected_provider: None,
             status,
             codex_cache,
+            claude_cache,
             show_help: false,
         }
         .with_selected_provider())
@@ -64,9 +73,12 @@ impl App {
         match load_or_bootstrap_data(&self.data_file, &self.config) {
             Ok(mut data) => {
                 merge_codex_usage(&mut data, &self.config, &mut self.codex_cache);
+                if self.config.claude_oauth_token.is_some() {
+                    merge_claude_usage(&mut data, &self.config, &mut self.claude_cache);
+                }
                 self.data = data;
                 self.sync_selected_provider();
-                self.status = build_status_line(&self.config, &self.codex_cache);
+                self.status = build_status_line(&self.config, &self.codex_cache, &self.claude_cache);
             }
             Err(err) => {
                 self.status = format!("Reload failed: {err}");
@@ -232,24 +244,40 @@ pub(crate) fn bootstrap_app(
     App::new(data_file, config_file)
 }
 
-fn build_status_line(config: &AppConfig, cache: &CodexImportCache) -> String {
-    if !config.codex_import.enabled {
+fn build_status_line(config: &AppConfig, cache: &CodexImportCache, claude_cache: &ClaudeImportDiagnostics) -> String {
+    let mut parts = Vec::new();
+    
+    if config.codex_import.enabled {
+        let diagnostics = codex_import_diagnostics(cache);
+        let imported_ago_secs = diagnostics
+            .last_import_at
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        parts.push(format!(
+            "Codex: {} files, {}s ago",
+            diagnostics.active_files,
+            imported_ago_secs
+        ));
+    }
+    
+    if config.claude_oauth_token.is_some() {
+        if let Some(err) = &claude_cache.fetch_error {
+            parts.push(format!("Claude: {}", err));
+        } else {
+            parts.push(format!(
+                "Claude: 5h {}/{}, 7d {}/{}",
+                claude_cache.five_hour_used,
+                claude_cache.five_hour_limit,
+                claude_cache.seven_day_used,
+                claude_cache.seven_day_limit
+            ));
+        }
+    }
+    
+    if parts.is_empty() {
         return "Ready".to_string();
     }
-    let diagnostics = codex_import_diagnostics(cache);
-    let imported_ago_secs = diagnostics
-        .last_import_at
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!(
-        "Codex import files:{} refreshed:{} parse:{} no_usage:{} unreadable:{} scan:{}s updated:{}s",
-        diagnostics.active_files,
-        diagnostics.refreshed_files,
-        diagnostics.parse_error_files,
-        diagnostics.no_usage_or_limits_files,
-        diagnostics.unreadable_files,
-        diagnostics.discovery_interval.as_secs(),
-        imported_ago_secs
-    )
+    
+    parts.join(" | ")
 }

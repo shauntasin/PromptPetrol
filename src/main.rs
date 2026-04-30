@@ -1,4 +1,5 @@
 mod app;
+mod claude_import;
 mod codex_import;
 mod models;
 mod ui;

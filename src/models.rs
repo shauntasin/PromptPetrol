@@ -69,6 +69,8 @@ pub(crate) struct AppConfig {
     pub(crate) pricing: HashMap<String, ModelPricing>,
     #[serde(default)]
     pub(crate) codex_import: CodexImportConfig,
+    #[serde(default)]
+    pub(crate) claude_oauth_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -107,6 +109,7 @@ impl Default for AppConfig {
             api_keys,
             pricing,
             codex_import: CodexImportConfig::default(),
+            claude_oauth_token: None,
         }
     }
 }
