@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::models::{AppConfig, UsageData, UsageEntry, estimate_cost_usd};
+use crate::models::AppConfig;
 
 const MIN_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
@@ -21,7 +21,6 @@ struct CachedCodexSession {
     input_tokens: u64,
     output_tokens: u64,
     cached_input_tokens: u64,
-    reasoning_output_tokens: u64,
     context_window: u64,
     has_token_usage: bool,
     limits: Option<CodexRateLimits>,
@@ -71,7 +70,6 @@ struct CodexSessionData {
     input_tokens: u64,
     output_tokens: u64,
     cached_input_tokens: u64,
-    reasoning_output_tokens: u64,
     context_window: u64,
     has_token_usage: bool,
     limits: Option<CodexRateLimits>,
@@ -115,8 +113,6 @@ struct CodexTotalTokenUsage {
     output_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
-    #[serde(default)]
-    reasoning_output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,7 +126,6 @@ struct CodexEventRateLimits {
 #[derive(Debug, Deserialize)]
 struct CodexRawRateLimit {
     used_percent: CodexRateLimitPercent,
-    window_minutes: u64,
     #[serde(default)]
     resets_at: Option<u64>,
 }
@@ -154,8 +149,6 @@ impl CodexRateLimitPercent {
 #[derive(Debug, Clone)]
 pub(crate) struct CodexRateLimit {
     pub(crate) used_percent: f64,
-    #[allow(dead_code)]
-    pub(crate) window_minutes: u64,
     pub(crate) resets_at: Option<u64>,
 }
 
@@ -191,11 +184,31 @@ impl Default for CodexImportCache {
     }
 }
 
-pub(crate) fn merge_codex_usage(
-    data: &mut UsageData,
-    config: &AppConfig,
-    cache: &mut CodexImportCache,
-) {
+#[cfg(test)]
+impl CodexImportCache {
+    /// Test helper: seed a single session so `codex_session_snapshot` reports a
+    /// context window, without touching the filesystem.
+    pub(crate) fn with_test_context(input: u64, cached: u64, output: u64, window: u64) -> Self {
+        let mut cache = Self::default();
+        cache.sessions.insert(
+            PathBuf::from("test-session.jsonl"),
+            CachedCodexSession {
+                modified: SystemTime::now(),
+                file_len: 0,
+                timestamp: "2026-06-18T00:00:00Z".to_string(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: cached,
+                context_window: window,
+                has_token_usage: true,
+                limits: None,
+            },
+        );
+        cache
+    }
+}
+
+pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache) {
     if !config.codex_import.enabled {
         return;
     }
@@ -211,36 +224,29 @@ pub(crate) fn merge_codex_usage(
         changes_detected = changes_detected || cache.session_files.len() != previous_count;
     }
 
-    let mut active = HashSet::new();
+    // `session_files` is the authoritative active set; only refresh entries whose
+    // mtime/len changed, and drop cached sessions whose file is gone or invalid.
     let mut refreshed_files = 0_usize;
     let mut parse_error_files = 0_usize;
     let mut no_usage_or_limits_files = 0_usize;
     let mut unreadable_files = 0_usize;
-    for file in &cache.session_files {
-        active.insert(file.clone());
-        let (modified, file_len) = match fs::metadata(file) {
-            Ok(metadata) => match metadata.modified() {
-                Ok(modified) => (modified, metadata.len()),
+    let files = std::mem::take(&mut cache.session_files);
+    for file in &files {
+        let (modified, file_len) =
+            match fs::metadata(file).and_then(|m| Ok((m.modified()?, m.len()))) {
+                Ok(meta) => meta,
                 Err(_) => {
+                    changes_detected = true;
                     unreadable_files += 1;
                     cache.sessions.remove(file);
                     continue;
                 }
-            },
-            Err(_) => {
-                changes_detected = true;
-                unreadable_files += 1;
-                cache.sessions.remove(file);
-                continue;
-            }
-        };
+            };
 
         let needs_refresh = cache
             .sessions
             .get(file)
-            .map(|cached| cached.modified != modified || cached.file_len != file_len)
-            .unwrap_or(true);
-
+            .is_none_or(|cached| cached.modified != modified || cached.file_len != file_len);
         if !needs_refresh {
             continue;
         }
@@ -266,14 +272,16 @@ pub(crate) fn merge_codex_usage(
         }
     }
 
-    cache.sessions.retain(|path, _| active.contains(path));
-    cache.session_files.retain(|path| active.contains(path));
+    // Drop any cached session whose file is no longer discovered.
+    cache.sessions.retain(|path, _| files.contains(path));
+    let active_count = files.len();
+    cache.session_files = files;
     cache.latest_limits = find_latest_limits(&cache.sessions);
     if discovery_ran {
         tune_discovery_interval(cache, changes_detected);
     }
     cache.diagnostics = CodexImportDiagnostics {
-        active_files: active.len(),
+        active_files: active_count,
         refreshed_files,
         parse_error_files,
         no_usage_or_limits_files,
@@ -281,33 +289,6 @@ pub(crate) fn merge_codex_usage(
         last_import_at: Some(SystemTime::now()),
         discovery_interval: cache.session_discovery_interval,
     };
-
-    let mut imported = cache
-        .sessions
-        .values()
-        .filter(|session| session.has_token_usage)
-        .map(|session| {
-            let model = &config.codex_import.model;
-            UsageEntry {
-                timestamp: session.timestamp.clone(),
-                provider: "codex".to_string(),
-                model: model.clone(),
-                input_tokens: session.input_tokens,
-                output_tokens: session.output_tokens,
-                cost_usd: estimate_cost_usd(
-                    "codex",
-                    model,
-                    session.input_tokens,
-                    session.output_tokens,
-                    &config.pricing,
-                ),
-            }
-        })
-        .collect::<Vec<_>>();
-
-    data.entries.retain(|e| e.provider != "codex");
-    data.entries.append(&mut imported);
-    data.entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 }
 
 fn should_refresh_file_discovery(cache: &CodexImportCache) -> bool {
@@ -337,86 +318,41 @@ fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool)
     cache.session_discovery_interval = std::cmp::min(next, MAX_DISCOVERY_INTERVAL);
 }
 
-#[allow(dead_code)]
+/// The most-recent session's token figures, used for the context-window gauge.
+/// Context is a per-conversation measure, so only the newest session matters.
+pub(crate) struct CodexSessionSnapshot {
+    pub(crate) latest_input: u64,
+    pub(crate) latest_output: u64,
+    pub(crate) latest_cached: u64,
+    pub(crate) latest_context_window: u64,
+    #[cfg(test)]
+    pub(crate) latest_timestamp: Option<String>,
+}
+
+pub(crate) fn codex_session_snapshot(cache: &CodexImportCache) -> Option<CodexSessionSnapshot> {
+    // Single pass: pick the newest session carrying token usage.
+    let latest = cache
+        .sessions
+        .values()
+        .filter(|s| s.has_token_usage)
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))?;
+
+    Some(CodexSessionSnapshot {
+        latest_input: latest.input_tokens,
+        latest_output: latest.output_tokens,
+        latest_cached: latest.cached_input_tokens,
+        latest_context_window: latest.context_window,
+        #[cfg(test)]
+        latest_timestamp: Some(latest.timestamp.clone()),
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn latest_codex_limits(cache: &CodexImportCache) -> Option<CodexRateLimits> {
     cache
         .latest_limits
         .clone()
         .or_else(|| find_latest_limits(&cache.sessions))
-}
-
-#[allow(dead_code)]
-pub(crate) struct CodexSessionSnapshot {
-    pub(crate) total_input: u64,
-    pub(crate) total_output: u64,
-    pub(crate) total_cached: u64,
-    pub(crate) total_reasoning: u64,
-    pub(crate) context_window: u64,
-    pub(crate) file_count: usize,
-    pub(crate) latest_timestamp: Option<String>,
-    pub(crate) limits_age_secs: Option<u64>,
-    // Most-recent session only. The context window is a per-conversation
-    // measure, so the context gauge uses these rather than the lifetime sums.
-    pub(crate) latest_input: u64,
-    pub(crate) latest_output: u64,
-    pub(crate) latest_cached: u64,
-    pub(crate) latest_context_window: u64,
-}
-
-pub(crate) fn codex_session_snapshot(cache: &CodexImportCache) -> Option<CodexSessionSnapshot> {
-    let sessions: Vec<&CachedCodexSession> = cache.sessions.values().collect();
-    if sessions.is_empty() {
-        return None;
-    }
-    let total_input: u64 = sessions.iter().map(|s| s.input_tokens).sum();
-    let total_output: u64 = sessions.iter().map(|s| s.output_tokens).sum();
-    let total_cached: u64 = sessions.iter().map(|s| s.cached_input_tokens).sum();
-    let total_reasoning: u64 = sessions.iter().map(|s| s.reasoning_output_tokens).sum();
-    let context_window = sessions.iter().map(|s| s.context_window).max().unwrap_or(0);
-
-    // Newest session carrying token usage drives both the freshness indicator
-    // and the context-window gauge.
-    let latest_session = sessions
-        .iter()
-        .filter(|s| s.has_token_usage)
-        .max_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
-    let latest_timestamp = latest_session.map(|s| s.timestamp.clone());
-    let latest_input = latest_session.map(|s| s.input_tokens).unwrap_or(0);
-    let latest_output = latest_session.map(|s| s.output_tokens).unwrap_or(0);
-    let latest_cached = latest_session.map(|s| s.cached_input_tokens).unwrap_or(0);
-    let latest_context_window = latest_session.map(|s| s.context_window).unwrap_or(0);
-
-    let limits_age_secs = latest_timestamp.as_ref().and_then(|ts| {
-        let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-        let now = chrono::Utc::now();
-        let age = now.signed_duration_since(dt);
-        if age.num_seconds() > 0 {
-            Some(age.num_seconds() as u64)
-        } else {
-            Some(0)
-        }
-    });
-
-    Some(CodexSessionSnapshot {
-        total_input,
-        total_output,
-        total_cached,
-        total_reasoning,
-        context_window,
-        file_count: sessions.len(),
-        latest_timestamp,
-        limits_age_secs,
-        latest_input,
-        latest_output,
-        latest_cached,
-        latest_context_window,
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) fn codex_import_diagnostics(cache: &CodexImportCache) -> CodexImportDiagnostics {
-    cache.diagnostics.clone()
 }
 
 fn codex_sessions_dir(config: &AppConfig) -> PathBuf {
@@ -470,7 +406,6 @@ fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) ->
             input_tokens: data.input_tokens,
             output_tokens: data.output_tokens,
             cached_input_tokens: data.cached_input_tokens,
-            reasoning_output_tokens: data.reasoning_output_tokens,
             context_window: data.context_window,
             has_token_usage: data.has_token_usage,
             limits: data.limits,
@@ -500,7 +435,6 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut cached_input_tokens: u64 = 0;
-    let mut reasoning_output_tokens: u64 = 0;
     let mut context_window: u64 = 0;
     let mut has_token_usage = false;
     let mut latest_limits: Option<CodexRateLimits> = None;
@@ -591,7 +525,6 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
                 input_tokens = total_usage.input_tokens;
                 output_tokens = total_usage.output_tokens;
                 cached_input_tokens = total_usage.cached_input_tokens;
-                reasoning_output_tokens = total_usage.reasoning_output_tokens;
                 has_token_usage = true;
             }
             if let Some(window) = info.model_context_window {
@@ -618,7 +551,6 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
         input_tokens,
         output_tokens,
         cached_input_tokens,
-        reasoning_output_tokens,
         context_window,
         has_token_usage,
         limits: latest_limits,
@@ -628,7 +560,6 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
 fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> CodexRateLimit {
     CodexRateLimit {
         used_percent: node.used_percent.as_f64(),
-        window_minutes: node.window_minutes,
         resets_at: node.resets_at,
     }
 }
@@ -653,7 +584,7 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::models::{AppConfig, UsageData};
+    use crate::models::AppConfig;
 
     #[test]
     fn parses_codex_session_usage_from_token_count_events() {
@@ -674,8 +605,6 @@ mod tests {
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
         assert!(parsed.has_token_usage);
         let limits = parsed.limits.expect("expected limits");
-        assert_eq!(limits.primary.expect("primary").window_minutes, 300);
-        assert_eq!(limits.secondary.expect("secondary").window_minutes, 10080);
     }
 
     #[test]
@@ -729,14 +658,12 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
-                reasoning_output_tokens: 0,
                 context_window: 0,
                 has_token_usage: false,
                 limits: Some(CodexRateLimits {
                     timestamp: "2026-02-18T00:00:00Z".to_string(),
                     primary: Some(CodexRateLimit {
                         used_percent: 12.0,
-                        window_minutes: 300,
                         resets_at: None,
                     }),
                     secondary: None,
@@ -753,14 +680,12 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_input_tokens: 0,
-                reasoning_output_tokens: 0,
                 context_window: 0,
                 has_token_usage: false,
                 limits: Some(CodexRateLimits {
                     timestamp: "2026-02-17T23:59:59Z".to_string(),
                     primary: Some(CodexRateLimit {
                         used_percent: 4.0,
-                        window_minutes: 300,
                         resets_at: None,
                     }),
                     secondary: None,
@@ -798,29 +723,22 @@ mod tests {
         let mut config = AppConfig::default();
         config.codex_import.enabled = true;
         config.codex_import.sessions_dir = Some(temp_root.to_string_lossy().to_string());
-        config.codex_import.model = "codex-cli".to_string();
 
-        let mut data = UsageData {
-            budget_usd: Some(10.0),
-            entries: vec![],
-        };
         let mut cache = CodexImportCache::default();
-        merge_codex_usage(&mut data, &config, &mut cache);
+        merge_codex_usage(&config, &mut cache);
 
-        let codex_entries = data
-            .entries
-            .iter()
-            .filter(|entry| entry.provider == "codex")
-            .collect::<Vec<_>>();
-        assert_eq!(codex_entries.len(), 1);
-        assert_eq!(codex_entries[0].input_tokens, 180);
-        assert_eq!(codex_entries[0].output_tokens, 55);
-        assert_eq!(codex_entries[0].timestamp, "2026-02-18T10:01:10.000Z");
+        let snap = codex_session_snapshot(&cache).expect("expected snapshot");
+        assert_eq!(snap.latest_input, 180);
+        assert_eq!(snap.latest_output, 55);
+        assert_eq!(
+            snap.latest_timestamp.as_deref(),
+            Some("2026-02-18T10:01:10.000Z")
+        );
 
         let limits = latest_codex_limits(&cache).expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 9.0);
         assert_eq!(limits.secondary.expect("secondary").used_percent, 4.0);
-        let diagnostics = codex_import_diagnostics(&cache);
+        let diagnostics = &cache.diagnostics;
         assert_eq!(diagnostics.active_files, 3);
         assert_eq!(diagnostics.refreshed_files, 3);
         assert_eq!(diagnostics.parse_error_files, 0);
@@ -868,17 +786,13 @@ mod tests {
         let mut config = AppConfig::default();
         config.codex_import.enabled = true;
         config.codex_import.sessions_dir = Some(temp_root.to_string_lossy().to_string());
-        let mut data = UsageData {
-            budget_usd: Some(10.0),
-            entries: vec![],
-        };
         let mut cache = CodexImportCache::default();
 
         assert_eq!(cache.session_discovery_interval, MIN_DISCOVERY_INTERVAL);
 
         for _ in 0..3 {
             cache.last_discovery_at = Some(SystemTime::now() - Duration::from_secs(3600));
-            merge_codex_usage(&mut data, &config, &mut cache);
+            merge_codex_usage(&config, &mut cache);
         }
         assert_eq!(
             cache.session_discovery_interval,
@@ -890,7 +804,7 @@ mod tests {
         write_fixture(&session_dir, "mixed_usage_and_limits.jsonl");
 
         cache.last_discovery_at = Some(SystemTime::now() - Duration::from_secs(3600));
-        merge_codex_usage(&mut data, &config, &mut cache);
+        merge_codex_usage(&config, &mut cache);
         assert_eq!(cache.session_discovery_interval, MIN_DISCOVERY_INTERVAL);
 
         let _ = fs::remove_dir_all(temp_root);

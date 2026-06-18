@@ -12,8 +12,11 @@ PromptPetrol is a Rust TUI app for monitoring AI token usage like fuel usage.
 - Normalization into a common `input_tokens` / `output_tokens` / `cost_usd` schema.
 - Automatic Codex CLI usage import from `~/.codex/sessions` (cached for fast refresh).
 - Live Claude usage import via the Claude Code OAuth token (5-hour and weekly limits).
-- Side-by-side Claude and Codex panels showing 5-hour limit, weekly limit, reset
-  countdowns, and (Codex) current context-window fill, refreshing at 0.1 Hz (every 10s).
+- Automotive-style instrument cluster: analog dials (BMW-like) for the 5-hour and
+  weekly limits with needles, tick arcs, and redline zones, plus a center
+  context-window readout. UI redraws at 2 Hz; data refreshes every ~10s.
+- Responsive layout: the dial cluster renders on large terminals (about 74x20 and
+  up); smaller terminals fall back to compact odometer bars, then to a single line.
 - Config-driven API keys and model pricing for cost estimation.
 
 ## Run
@@ -26,17 +29,13 @@ Optional flags:
 
 ```bash
 cargo run -- \
-  --data-file /path/to/usage.json \
   --config-file /path/to/config.json \
-  --refresh-interval-seconds 10
+  --refresh-interval-seconds 10   # accepts fractional seconds, e.g. 0.5
 ```
 
-Export provider summaries without opening the TUI:
-
-```bash
-cargo run -- --export-json /tmp/promptpetrol-summary.json
-cargo run -- --export-csv /tmp/promptpetrol-summary.csv
-```
+The UI redraws at 2 Hz for responsiveness; `--refresh-interval-seconds` controls
+how often the underlying data (Claude network fetch + Codex session scan) is
+re-read. These are decoupled so a fast UI does not spam the Claude API.
 
 ## Controls
 

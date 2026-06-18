@@ -4,7 +4,7 @@ use color_eyre::Result;
 use serde::Deserialize;
 
 use crate::codex_import::{CodexRateLimit, CodexRateLimits};
-use crate::models::{AppConfig, UsageData};
+use crate::models::AppConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClaudeOAuthUsage {
@@ -15,17 +15,9 @@ pub(crate) struct ClaudeOAuthUsage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct ClaudeUsageWindow {
-    // The OAuth usage endpoint currently reports only `utilization` (already a
-    // percent, e.g. 42.0) and `resets_at`. `used`/`limit` are kept optional so a
-    // schema that adds them back still deserializes, and one that omits them
-    // (today's) does not get rejected.
-    #[serde(default)]
-    pub(crate) used: Option<u64>,
-    #[serde(default)]
-    pub(crate) limit: Option<u64>,
-    #[serde(rename = "resets_at")]
+    // The OAuth usage endpoint reports `utilization` (already a percent, e.g.
+    // 42.0) and `resets_at`. Other fields are ignored by serde.
     pub(crate) resets_at: Option<String>,
     pub(crate) utilization: f64,
 }
@@ -64,19 +56,12 @@ pub(crate) fn fetch_claude_usage(oauth_token: &str) -> Result<Option<ClaudeOAuth
     Ok(Some(usage))
 }
 
-// `_data` is unused for now: the OAuth endpoint exposes only utilization
-// percentages, no token counts to fold into `UsageData`. Kept for signature
-// symmetry with `merge_codex_usage` and the `app.rs` reload path.
-pub(crate) fn merge_claude_usage(
-    _data: &mut UsageData,
-    config: &AppConfig,
-    diagnostics: &mut ClaudeImportDiagnostics,
-) {
+pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImportDiagnostics) {
     let token = config
         .claude_oauth_token
-        .as_ref()
+        .as_deref()
         .filter(|t| !t.is_empty())
-        .cloned()
+        .map(str::to_owned)
         .or_else(detect_claude_token);
 
     let Some(oauth_token) = token else {
@@ -84,33 +69,24 @@ pub(crate) fn merge_claude_usage(
         return;
     };
 
+    // `utilization` from the OAuth endpoint is already a percentage (e.g. 42.0),
+    // so it maps straight onto `used_percent`.
+    let window = |w: &ClaudeUsageWindow| CodexRateLimit {
+        used_percent: w.utilization,
+        resets_at: parse_iso_to_epoch(&w.resets_at),
+    };
+
     match fetch_claude_usage(&oauth_token) {
         Ok(Some(usage)) => {
-            let now = chrono::Utc::now().to_rfc3339();
-
-            // `utilization` from the OAuth endpoint is already a percentage
-            // (e.g. 42.0), so it maps straight onto `used_percent`.
-            let five_hour_limit = CodexRateLimit {
-                used_percent: usage.five_hour.utilization,
-                window_minutes: 300,
-                resets_at: parse_iso_to_epoch(&usage.five_hour.resets_at),
-            };
-            let seven_day_limit = CodexRateLimit {
-                used_percent: usage.seven_day.utilization,
-                window_minutes: 10080,
-                resets_at: parse_iso_to_epoch(&usage.seven_day.resets_at),
-            };
-            let limits = CodexRateLimits {
-                timestamp: now,
-                primary: Some(five_hour_limit),
-                secondary: Some(seven_day_limit),
-            };
-
             diagnostics.last_fetch_at = Some(SystemTime::now());
             diagnostics.fetch_error = None;
             diagnostics.five_hour_pct = usage.five_hour.utilization;
             diagnostics.seven_day_pct = usage.seven_day.utilization;
-            diagnostics.limits = Some(limits);
+            diagnostics.limits = Some(CodexRateLimits {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                primary: Some(window(&usage.five_hour)),
+                secondary: Some(window(&usage.seven_day)),
+            });
         }
         Ok(None) => {
             diagnostics.fetch_error = Some("Auth failed (401/403)".into());
