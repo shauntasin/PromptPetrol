@@ -9,179 +9,310 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::App;
-use crate::codex_import::{
-    CodexRateLimit, CodexRateLimits, codex_import_diagnostics, latest_codex_limits,
-};
-use crate::models::{provider_stats, provider_summaries};
+use crate::claude_import::ClaudeImportDiagnostics;
+use crate::codex_import::{CodexImportCache, codex_session_snapshot};
 
 const APP_NAME: &str = "PromptPetrol";
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let providers = provider_summaries(&app.data);
     let area = frame.area();
+    let w = area.width;
+    let h = area.height;
+
+    if w < 12 || h < 6 {
+        let msg = if w < 12 { "width" } else { "height" };
+        frame.render_widget(
+            Paragraph::new(format!("{APP_NAME} - terminal {msg} too small")),
+            area,
+        );
+        return;
+    }
 
     let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(8)])
-        .split(area);
-    let top_panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(chunks[0]);
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
 
-    let selected_provider = app.selected_provider.as_deref().unwrap_or("");
-    let selected_stats = provider_stats(&app.data, selected_provider);
-    let max_cost = providers
-        .iter()
-        .map(|p| p.total_cost_usd)
-        .fold(0.0_f64, f64::max);
-    let max_tokens = providers
-        .iter()
-        .map(|p| p.total_tokens)
-        .fold(0_u64, u64::max);
-
-    let budget_ratio = match (selected_stats.as_ref(), app.data.budget_usd) {
-        (Some(provider), Some(budget)) if budget > 0.0 => {
-            (provider.total_cost_usd / budget).clamp(0.0, 1.0)
-        }
-        _ => 0.0,
-    };
-    let token_ratio = selected_stats
-        .as_ref()
-        .map(|provider| {
-            if max_tokens == 0 {
-                0.0
-            } else {
-                (provider.total_tokens as f64 / max_tokens as f64).clamp(0.0, 1.0)
-            }
-        })
-        .unwrap_or(0.0);
-    let spend_ratio = selected_stats
-        .as_ref()
-        .map(|provider| {
-            if max_cost <= f64::EPSILON {
-                0.0
-            } else {
-                (provider.total_cost_usd / max_cost).clamp(0.0, 1.0)
-            }
-        })
-        .unwrap_or(0.0);
-    let activity_ratio = selected_stats
-        .as_ref()
-        .map(|provider| {
-            let total_requests = app.data.entries.len();
-            if total_requests == 0 {
-                0.0
-            } else {
-                (provider.requests as f64 / total_requests as f64).clamp(0.0, 1.0)
-            }
-        })
-        .unwrap_or(0.0);
-    let fuel_ratio = (1.0 - budget_ratio).clamp(0.0, 1.0);
-    let is_codex = selected_provider == "codex";
-    let codex_limits = if is_codex {
-        latest_codex_limits(&app.codex_cache)
-    } else {
-        None
-    };
-    let codex_import_age_secs = if is_codex {
-        codex_import_diagnostics(&app.codex_cache)
-            .last_import_at
-            .and_then(|timestamp| SystemTime::now().duration_since(timestamp).ok())
-            .map(|duration| duration.as_secs())
-    } else {
-        None
-    };
-
-    let basic_line = if let Some(provider) = selected_stats.as_ref() {
-        if is_codex {
-            format!(
-                "{APP_NAME} | codex/{} | {} tok | {} req",
-                app.config.codex_import.model, provider.total_tokens, provider.requests
-            )
-        } else {
-            format!(
-                "{APP_NAME} | {} | ${:.3} | {} tok | {} req",
-                provider.provider,
-                provider.total_cost_usd,
-                provider.total_tokens,
-                provider.requests
-            )
-        }
-    } else {
-        format!("{APP_NAME} | No provider data")
-    };
-    let info_line = if app.status.is_empty() {
-        basic_line
-    } else {
-        format!("{basic_line} | {}", app.status)
-    };
-    let alert_lines = if is_codex {
-        build_codex_alert_lines(codex_limits.as_ref(), codex_import_age_secs)
-    } else {
-        build_alert_lines(fuel_ratio, token_ratio, spend_ratio, activity_ratio)
-    };
-    frame.render_widget(
-        Paragraph::new(info_line).block(rounded_block("Info")),
-        top_panels[0],
-    );
-    frame.render_widget(
-        Paragraph::new(alert_lines).block(rounded_block("Alerts")),
-        top_panels[1],
-    );
-
-    let gauge_block_title = if is_codex {
-        "Codex Limit Dials"
-    } else {
-        "Usage Dials"
-    };
-    let gauge_block = rounded_block(gauge_block_title);
-    let gauge_inner = gauge_block.inner(chunks[1]);
-    frame.render_widget(gauge_block, chunks[1]);
-
-    if is_codex {
-        let codex_gauges = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(gauge_inner);
-        let five_hour_ratio = codex_limits
-            .as_ref()
-            .and_then(|limits| limits.primary.as_ref())
-            .map(|limit| (limit.used_percent / 100.0).clamp(0.0, 1.0))
-            .unwrap_or(0.0);
-        let weekly_ratio = codex_limits
-            .as_ref()
-            .and_then(|limits| limits.secondary.as_ref())
-            .map(|limit| (limit.used_percent / 100.0).clamp(0.0, 1.0))
-            .unwrap_or(0.0);
-        render_analog_gauge(frame, codex_gauges[0], "5h Limit", five_hour_ratio, "used");
-        render_analog_gauge(frame, codex_gauges[1], "Weekly Limit", weekly_ratio, "used");
-    } else {
-        let gauge_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(gauge_inner);
-        let top_gauges = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(gauge_rows[0]);
-        let bottom_gauges = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(gauge_rows[1]);
-
-        render_analog_gauge(frame, top_gauges[0], "Fuel Tank", fuel_ratio, "left");
-        render_analog_gauge(frame, top_gauges[1], "RPM", token_ratio, "load");
-        render_analog_gauge(frame, bottom_gauges[0], "Throttle", spend_ratio, "burn");
-        render_analog_gauge(frame, bottom_gauges[1], "Traffic", activity_ratio, "flow");
-    }
+    render_claude_panel(frame, chunks[0], &app.claude_cache);
+    render_codex_panel(frame, chunks[1], &app.codex_cache);
 
     if app.show_help {
         draw_help_overlay(frame);
     }
 }
 
-fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f64, unit: &str) {
+fn render_claude_panel(frame: &mut Frame<'_>, area: Rect, cache: &ClaudeImportDiagnostics) {
+    let inner = rounded_block("Claude").inner(area);
+    frame.render_widget(rounded_block("Claude"), area);
+
+    if inner.height < 4 || inner.width < 8 {
+        return;
+    }
+
+    let limits = cache.limits.as_ref();
+
+    let five_h_ratio = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| (l.used_percent / 100.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let seven_d_ratio = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| (l.used_percent / 100.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    let gauges = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let min_g = 8u16;
+    if gauges[0].width >= min_g && gauges[0].height >= 6 {
+        render_gauge(frame, gauges[0], "5h Limit", five_h_ratio);
+    } else {
+        render_bar(frame, gauges[0], "5h", five_h_ratio);
+    }
+    if gauges[1].width >= min_g && gauges[1].height >= 6 {
+        render_gauge(frame, gauges[1], "7d Limit", seven_d_ratio);
+    } else {
+        render_bar(frame, gauges[1], "7d", seven_d_ratio);
+    }
+
+    let text_y = inner.y + inner.height.saturating_sub(5);
+    let text_h = 5.min(inner.height);
+    let text_area = Rect {
+        x: inner.x,
+        y: text_y,
+        width: inner.width,
+        height: text_h,
+    };
+
+    let mut lines = Vec::new();
+
+    // The OAuth usage endpoint reports utilization percentages directly; prefer
+    // the parsed limits, falling back to the diagnostics percent fields.
+    let five_h_pct = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| l.used_percent)
+        .unwrap_or(cache.five_hour_pct);
+    let seven_d_pct = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| l.used_percent)
+        .unwrap_or(cache.seven_day_pct);
+
+    lines.push(Line::from(vec![
+        Span::styled(" 5h Limit ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{five_h_pct:>5.1}%"),
+            Style::default().fg(percent_color(five_h_pct)),
+        ),
+    ]));
+
+    let five_h_reset = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| format_reset(l.resets_at))
+        .unwrap_or_else(|| "unknown".into());
+    lines.push(Line::from(vec![Span::styled(
+        format!("      reset {five_h_reset}"),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    lines.push(Line::from(vec![
+        Span::styled(" Weekly   ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{seven_d_pct:>5.1}%"),
+            Style::default().fg(percent_color(seven_d_pct)),
+        ),
+    ]));
+
+    let seven_d_reset = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| format_reset(l.resets_at))
+        .unwrap_or_else(|| "unknown".into());
+    lines.push(Line::from(vec![Span::styled(
+        format!("      reset {seven_d_reset}"),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    frame.render_widget(Paragraph::new(lines), text_area);
+}
+
+fn render_codex_panel(frame: &mut Frame<'_>, area: Rect, cache: &CodexImportCache) {
+    let inner = rounded_block("Codex").inner(area);
+    frame.render_widget(rounded_block("Codex"), area);
+
+    if inner.height < 4 || inner.width < 8 {
+        return;
+    }
+
+    let limits = cache.latest_limits.as_ref();
+
+    let five_h_ratio = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| (l.used_percent / 100.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let weekly_ratio = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| (l.used_percent / 100.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    let gauges = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let min_g = 8u16;
+    if gauges[0].width >= min_g && gauges[0].height >= 6 {
+        render_gauge(frame, gauges[0], "5h Limit", five_h_ratio);
+    } else {
+        render_bar(frame, gauges[0], "5h", five_h_ratio);
+    }
+    if gauges[1].width >= min_g && gauges[1].height >= 6 {
+        render_gauge(frame, gauges[1], "Weekly", weekly_ratio);
+    } else {
+        render_bar(frame, gauges[1], "WK", weekly_ratio);
+    }
+
+    let text_y = inner.y + inner.height.saturating_sub(5);
+    let text_h = 5.min(inner.height);
+    let text_area = Rect {
+        x: inner.x,
+        y: text_y,
+        width: inner.width,
+        height: text_h,
+    };
+
+    let mut lines = Vec::new();
+
+    let five_h_used = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| format!("{:.1}%", l.used_percent))
+        .unwrap_or_else(|| "--".into());
+    let weekly_used = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| format!("{:.1}%", l.used_percent))
+        .unwrap_or_else(|| "--".into());
+
+    let five_h_color = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| percent_color(l.used_percent))
+        .unwrap_or(Color::DarkGray);
+    let weekly_color = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| percent_color(l.used_percent))
+        .unwrap_or(Color::DarkGray);
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" 5h     {five_h_used:>6}"),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!(" {} ", color_label(five_h_color)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(five_h_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let five_h_reset = limits
+        .and_then(|l| l.primary.as_ref())
+        .map(|l| format_reset(l.resets_at))
+        .unwrap_or_else(|| "unknown".into());
+    lines.push(Line::from(vec![Span::styled(
+        format!("         reset {five_h_reset}"),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" Wkly   {weekly_used:>6}"),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!(" {} ", color_label(weekly_color)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(weekly_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let weekly_reset = limits
+        .and_then(|l| l.secondary.as_ref())
+        .map(|l| format_reset(l.resets_at))
+        .unwrap_or_else(|| "unknown".into());
+    lines.push(Line::from(vec![Span::styled(
+        format!("         reset {weekly_reset}"),
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    // Show context window from the most-recent session (a per-conversation
+    // measure), not the lifetime sum across all sessions.
+    if let Some(snap) = codex_session_snapshot(cache) {
+        // Codex reports input_tokens cumulatively (cache re-reads included), so
+        // it overshoots the window. Live residency = fresh input + output.
+        let ctx_tokens = snap.latest_input.saturating_sub(snap.latest_cached) + snap.latest_output;
+        let ctx_window = snap.latest_context_window;
+
+        let age_str = match snap.limits_age_secs {
+            Some(age) if age < 300 => "live".to_string(),
+            Some(age) if age < 3600 => format!("{}m ago", age / 60),
+            Some(age) if age < 86400 => format!("{}h ago", age / 3600),
+            Some(age) => format!("{}d ago", age / 86400),
+            None => "unknown".to_string(),
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Updated {age_str}"),
+            Style::default().fg(Color::DarkGray),
+        )]));
+
+        if ctx_window > 0 && ctx_tokens > 0 {
+            let ctx_pct = ctx_tokens as f64 / ctx_window as f64 * 100.0;
+            let ctx_color = if ctx_pct >= 90.0 {
+                Color::Red
+            } else if ctx_pct >= 70.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" CTX {:.0}%", ctx_pct),
+                    Style::default().fg(ctx_color),
+                ),
+                Span::styled(
+                    format!(" {}K/{}K", ctx_tokens / 1000, ctx_window / 1000),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), text_area);
+}
+
+fn percent_color(pct: f64) -> Color {
+    if pct >= 90.0 {
+        Color::Red
+    } else if pct >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn color_label(c: Color) -> &'static str {
+    match c {
+        Color::Red => "ALERT",
+        Color::Yellow => "WATCH",
+        _ => "NOM",
+    }
+}
+
+fn render_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f64) {
     let ratio = ratio.clamp(0.0, 1.0);
     let gauge_color = if ratio >= 0.9 {
         Color::Red
@@ -190,11 +321,10 @@ fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f6
     } else {
         Color::Cyan
     };
-    let dial_block = rounded_block(title);
 
     frame.render_widget(
         Canvas::default()
-            .block(dial_block)
+            .block(rounded_block(title))
             .x_bounds([-1.2, 1.2])
             .y_bounds([-1.2, 1.2])
             .paint(|ctx| {
@@ -205,29 +335,29 @@ fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f6
                     color: Color::DarkGray,
                 });
 
-                for step in 0..=10 {
-                    let tick_ratio = step as f64 / 10.0;
-                    let tick_angle = 225.0 - (270.0 * tick_ratio);
-                    let tick_rad = tick_angle.to_radians();
-                    let (outer_x, outer_y) = (tick_rad.cos() * 0.96, tick_rad.sin() * 0.96);
-                    let (inner_x, inner_y) = (tick_rad.cos() * 0.82, tick_rad.sin() * 0.82);
+                let tick_count = if area.width < 14 || area.height < 10 {
+                    5
+                } else {
+                    10
+                };
+                for step in 0..=tick_count {
+                    let t = step as f64 / tick_count as f64;
+                    let angle = (225.0 - 270.0 * t).to_radians();
                     ctx.draw(&CanvasLine {
-                        x1: inner_x,
-                        y1: inner_y,
-                        x2: outer_x,
-                        y2: outer_y,
+                        x1: angle.cos() * 0.82,
+                        y1: angle.sin() * 0.82,
+                        x2: angle.cos() * 0.96,
+                        y2: angle.sin() * 0.96,
                         color: Color::Gray,
                     });
                 }
 
-                let angle_deg = 225.0 - (270.0 * ratio);
-                let angle = angle_deg.to_radians();
-                let (needle_x, needle_y) = (angle.cos() * 0.76, angle.sin() * 0.76);
+                let angle = (225.0 - 270.0 * ratio).to_radians();
                 ctx.draw(&CanvasLine {
                     x1: 0.0,
                     y1: 0.0,
-                    x2: needle_x,
-                    y2: needle_y,
+                    x2: angle.cos() * 0.76,
+                    y2: angle.sin() * 0.76,
                     color: gauge_color,
                 });
                 ctx.draw(&Circle {
@@ -240,7 +370,13 @@ fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f6
         area,
     );
 
-    let value_text = format!("{:>5.1}% {unit}", ratio * 100.0);
+    let value_text = if area.width >= 14 {
+        format!("{:>5.1}%", ratio * 100.0)
+    } else if area.width >= 8 {
+        format!("{:>4.0}%", ratio * 100.0)
+    } else {
+        return;
+    };
     let value_area = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(area.height.saturating_sub(2)),
@@ -258,209 +394,72 @@ fn render_analog_gauge(frame: &mut Frame<'_>, area: Rect, title: &str, ratio: f6
     );
 }
 
-fn build_alert_lines(
-    fuel_ratio: f64,
-    token_ratio: f64,
-    spend_ratio: f64,
-    activity_ratio: f64,
-) -> Vec<Line<'static>> {
-    vec![
-        alert_line("LOW FUEL", fuel_ratio <= 0.20, fuel_ratio, true),
-        alert_line("HIGH RPM", token_ratio >= 0.85, token_ratio, false),
-        alert_line("OVERBURN", spend_ratio >= 0.85, spend_ratio, false),
-        alert_line("TRAFFIC JAM", activity_ratio >= 0.90, activity_ratio, false),
-    ]
-}
+fn render_bar(frame: &mut Frame<'_>, area: Rect, label: &str, ratio: f64) {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let bar_color = percent_color(ratio * 100.0);
 
-fn alert_line(label: &str, alert: bool, ratio: f64, low_is_bad: bool) -> Line<'static> {
-    let ratio_pct = ratio * 100.0;
-    if alert {
-        return Line::from(vec![
-            Span::styled(
-                format!(" {label:<11} "),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  ALERT  ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {:>5.1}%", ratio_pct),
-                Style::default().fg(Color::Red),
-            ),
-        ]);
+    let block = rounded_block(label);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 6 || inner.height < 1 {
+        return;
     }
 
-    let healthy = if low_is_bad {
-        ratio >= 0.35
-    } else {
-        ratio <= 0.70
-    };
-    let state = if healthy { "NOMINAL" } else { "WATCH  " };
-    let state_bg = if healthy { Color::Green } else { Color::Yellow };
+    let pct_str = format!("{:.0}%", ratio * 100.0);
+    let bar_chars = inner.width.saturating_sub(pct_str.len() as u16 + 3) as usize;
+    if bar_chars < 2 {
+        return;
+    }
 
-    Line::from(vec![
-        Span::styled(format!(" {label:<11} "), Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!(" {state} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(state_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {:>5.1}%", ratio_pct),
-            Style::default().fg(Color::Cyan),
-        ),
-    ])
+    let filled = ((ratio * bar_chars as f64).round() as usize).min(bar_chars);
+    let empty = bar_chars - filled;
+
+    let bar_row = format!("[{}{}] {pct_str}", "#".repeat(filled), "-".repeat(empty),);
+    frame.render_widget(
+        Paragraph::new(bar_row).style(Style::default().fg(bar_color)),
+        inner,
+    );
 }
 
-fn build_codex_alert_lines(
-    limits: Option<&CodexRateLimits>,
-    import_age_secs: Option<u64>,
-) -> Vec<Line<'static>> {
-    let Some(limits) = limits else {
-        return vec![
-            Line::from(Span::styled(
-                " Codex rate limits unavailable ",
-                Style::default().fg(Color::Yellow),
-            )),
-            codex_freshness_line(import_age_secs),
-        ];
+fn format_reset(resets_at: Option<u64>) -> String {
+    let Some(target) = resets_at else {
+        return "unknown".into();
     };
-
-    vec![
-        codex_alert_line("5H LIMIT", limits.primary.as_ref()),
-        codex_alert_line("WEEKLY", limits.secondary.as_ref()),
-        codex_freshness_line(import_age_secs),
-    ]
-}
-
-fn codex_freshness_line(import_age_secs: Option<u64>) -> Line<'static> {
-    let Some(age_secs) = import_age_secs else {
-        return Line::from(vec![
-            Span::styled(" FRESHNESS ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                " UNKNOWN ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    };
-
-    let (state, color) = if age_secs <= 30 {
-        ("LIVE", Color::Green)
-    } else if age_secs <= 120 {
-        ("STALE", Color::Yellow)
-    } else {
-        ("OLD", Color::Red)
-    };
-
-    Line::from(vec![
-        Span::styled(" FRESHNESS ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!(" {:<7} ", state),
-            Style::default()
-                .fg(Color::Black)
-                .bg(color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" updated {age_secs}s ago"),
-            Style::default().fg(Color::Cyan),
-        ),
-    ])
-}
-
-fn codex_alert_line(label: &str, limit: Option<&CodexRateLimit>) -> Line<'static> {
-    let Some(limit) = limit else {
-        return Line::from(vec![
-            Span::styled(format!(" {label:<8} "), Style::default().fg(Color::Gray)),
-            Span::styled(
-                " UNAVAILABLE ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    };
-
-    let ratio = (limit.used_percent / 100.0).clamp(0.0, 1.0);
-    let state = if ratio >= 0.9 {
-        ("ALERT", Color::Red)
-    } else if ratio >= 0.75 {
-        ("WATCH", Color::Yellow)
-    } else {
-        ("NOMINAL", Color::Green)
-    };
-
-    Line::from(vec![
-        Span::styled(format!(" {label:<8} "), Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!(" {:<7} ", state.0),
-            Style::default()
-                .fg(Color::Black)
-                .bg(state.1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {:>5.1}% ", limit.used_percent),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            format!(
-                "{}m reset {}",
-                limit.window_minutes,
-                format_reset_timing(limit.resets_at)
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-    ])
-}
-
-fn format_reset_timing(resets_at: Option<u64>) -> String {
-    let Some(target_epoch) = resets_at else {
-        return "unknown".to_string();
-    };
-    let now_epoch = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-
-    if target_epoch <= now_epoch {
-        return "now".to_string();
+    if target <= now {
+        return "now".into();
     }
-
-    let remaining = target_epoch - now_epoch;
-    let hours = remaining / 3600;
-    let minutes = (remaining % 3600) / 60;
-    format!("in {hours}h {minutes}m")
+    let remaining = target - now;
+    let h = remaining / 3600;
+    let m = (remaining % 3600) / 60;
+    if h > 0 {
+        format!("in {h}h{m}m")
+    } else {
+        format!("in {m}m")
+    }
 }
 
 fn draw_help_overlay(frame: &mut Frame<'_>) {
-    let area = centered_rect(60, 40, frame.area());
+    let area = frame.area();
+    let pct_x = if area.width < 30 { 80 } else { 50 };
+    let pct_y = if area.height < 15 { 70 } else { 40 };
+    let overlay = centered_rect(pct_x, pct_y, area);
+
     let help_lines = vec![
         Line::from("Controls"),
         Line::from("q : quit"),
-        Line::from("r : reload usage/config"),
-        Line::from("Left/h/k : previous provider"),
-        Line::from("Right/l/j : next provider"),
+        Line::from("r : reload"),
         Line::from("? : toggle help"),
     ];
 
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, overlay);
     frame.render_widget(
-        Paragraph::new(help_lines).block(rounded_block("Keyboard Help")),
-        area,
+        Paragraph::new(help_lines).block(rounded_block("Help")),
+        overlay,
     );
 }
 

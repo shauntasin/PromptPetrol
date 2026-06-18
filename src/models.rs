@@ -185,6 +185,7 @@ pub(crate) struct ProviderSummary {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct ProviderStats {
     pub(crate) provider: String,
     pub(crate) total_tokens: u64,
@@ -220,6 +221,7 @@ pub(crate) fn provider_summaries(data: &UsageData) -> Vec<ProviderSummary> {
     summaries
 }
 
+#[allow(dead_code)]
 pub(crate) fn provider_stats(data: &UsageData, provider: &str) -> Option<ProviderStats> {
     if provider.is_empty() {
         return None;

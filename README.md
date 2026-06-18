@@ -11,6 +11,9 @@ PromptPetrol is a Rust TUI app for monitoring AI token usage like fuel usage.
 - Provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and generic formats.
 - Normalization into a common `input_tokens` / `output_tokens` / `cost_usd` schema.
 - Automatic Codex CLI usage import from `~/.codex/sessions` (cached for fast refresh).
+- Live Claude usage import via the Claude Code OAuth token (5-hour and weekly limits).
+- Side-by-side Claude and Codex panels showing 5-hour limit, weekly limit, reset
+  countdowns, and (Codex) current context-window fill, refreshing at 0.1 Hz (every 10s).
 - Config-driven API keys and model pricing for cost estimation.
 
 ## Run
@@ -109,7 +112,27 @@ When `codex_import.enabled` is true, PromptPetrol reads Codex session `.jsonl` f
 - Or custom: `codex_import.sessions_dir`
 
 PromptPetrol uses the latest `token_count` totals found in each session file and adds them as `provider = "codex"` entries in the dashboard.
-It also shows Codex rate-limit usage in Alerts (5-hour and weekly) when available in session events.
+It also shows Codex rate-limit usage (5-hour and weekly) and the current context-window
+fill, taken from the most recent session, when available in session events.
+
+> Context-window fill uses the latest session's *fresh* tokens
+> (`input − cached_input + output`) against `model_context_window`, since Codex
+> reports `input_tokens` cumulatively across turns.
+
+## Claude usage import
+
+PromptPetrol shows live Claude subscription usage (5-hour and weekly limits with
+reset countdowns) by querying the Claude OAuth usage endpoint. The OAuth token is
+resolved in this order:
+
+1. `claude_oauth_token` in `config.json`, if set and non-empty.
+2. Auto-detected from the macOS Keychain entry that Claude Code stores
+   (`Claude Code-credentials`).
+
+The endpoint reports a utilization percentage per window (not raw token counts),
+so the Claude panel displays percentages plus reset times. If the token is missing
+or rejected, the status line shows the reason (e.g. `No OAuth token` or
+`Auth failed (401/403)`).
 
 ## Troubleshooting Codex import
 

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -20,11 +20,15 @@ struct CachedCodexSession {
     timestamp: String,
     input_tokens: u64,
     output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_output_tokens: u64,
+    context_window: u64,
     has_token_usage: bool,
     limits: Option<CodexRateLimits>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct CodexImportDiagnostics {
     pub(crate) active_files: usize,
     pub(crate) refreshed_files: usize,
@@ -57,9 +61,20 @@ enum ParsedSessionFile {
 }
 
 enum ParsedSessionContents {
-    Parsed((String, u64, u64, bool, Option<CodexRateLimits>)),
+    Parsed(CodexSessionData),
     NoUsageOrLimits,
     ParseError,
+}
+
+struct CodexSessionData {
+    timestamp: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_output_tokens: u64,
+    context_window: u64,
+    has_token_usage: bool,
+    limits: Option<CodexRateLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,12 +103,20 @@ struct CodexSessionLinePayload {
 struct CodexTokenInfo {
     #[serde(default)]
     total_token_usage: Option<CodexTotalTokenUsage>,
+    #[serde(default)]
+    model_context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CodexTotalTokenUsage {
+    #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,13 +154,14 @@ impl CodexRateLimitPercent {
 #[derive(Debug, Clone)]
 pub(crate) struct CodexRateLimit {
     pub(crate) used_percent: f64,
+    #[allow(dead_code)]
     pub(crate) window_minutes: u64,
     pub(crate) resets_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodexRateLimits {
-    timestamp: String,
+    pub(crate) timestamp: String,
     pub(crate) primary: Option<CodexRateLimit>,
     pub(crate) secondary: Option<CodexRateLimit>,
 }
@@ -145,12 +169,12 @@ pub(crate) struct CodexRateLimits {
 #[derive(Debug)]
 pub(crate) struct CodexImportCache {
     sessions: HashMap<PathBuf, CachedCodexSession>,
-    latest_limits: Option<CodexRateLimits>,
+    pub(crate) latest_limits: Option<CodexRateLimits>,
     session_files: Vec<PathBuf>,
     last_discovery_at: Option<SystemTime>,
     session_discovery_interval: Duration,
     idle_discovery_cycles: u32,
-    diagnostics: CodexImportDiagnostics,
+    pub(crate) diagnostics: CodexImportDiagnostics,
 }
 
 impl Default for CodexImportCache {
@@ -281,6 +305,7 @@ pub(crate) fn merge_codex_usage(
         })
         .collect::<Vec<_>>();
 
+    data.entries.retain(|e| e.provider != "codex");
     data.entries.append(&mut imported);
     data.entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 }
@@ -312,6 +337,7 @@ fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool)
     cache.session_discovery_interval = std::cmp::min(next, MAX_DISCOVERY_INTERVAL);
 }
 
+#[allow(dead_code)]
 pub(crate) fn latest_codex_limits(cache: &CodexImportCache) -> Option<CodexRateLimits> {
     cache
         .latest_limits
@@ -319,6 +345,76 @@ pub(crate) fn latest_codex_limits(cache: &CodexImportCache) -> Option<CodexRateL
         .or_else(|| find_latest_limits(&cache.sessions))
 }
 
+#[allow(dead_code)]
+pub(crate) struct CodexSessionSnapshot {
+    pub(crate) total_input: u64,
+    pub(crate) total_output: u64,
+    pub(crate) total_cached: u64,
+    pub(crate) total_reasoning: u64,
+    pub(crate) context_window: u64,
+    pub(crate) file_count: usize,
+    pub(crate) latest_timestamp: Option<String>,
+    pub(crate) limits_age_secs: Option<u64>,
+    // Most-recent session only. The context window is a per-conversation
+    // measure, so the context gauge uses these rather than the lifetime sums.
+    pub(crate) latest_input: u64,
+    pub(crate) latest_output: u64,
+    pub(crate) latest_cached: u64,
+    pub(crate) latest_context_window: u64,
+}
+
+pub(crate) fn codex_session_snapshot(cache: &CodexImportCache) -> Option<CodexSessionSnapshot> {
+    let sessions: Vec<&CachedCodexSession> = cache.sessions.values().collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    let total_input: u64 = sessions.iter().map(|s| s.input_tokens).sum();
+    let total_output: u64 = sessions.iter().map(|s| s.output_tokens).sum();
+    let total_cached: u64 = sessions.iter().map(|s| s.cached_input_tokens).sum();
+    let total_reasoning: u64 = sessions.iter().map(|s| s.reasoning_output_tokens).sum();
+    let context_window = sessions.iter().map(|s| s.context_window).max().unwrap_or(0);
+
+    // Newest session carrying token usage drives both the freshness indicator
+    // and the context-window gauge.
+    let latest_session = sessions
+        .iter()
+        .filter(|s| s.has_token_usage)
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let latest_timestamp = latest_session.map(|s| s.timestamp.clone());
+    let latest_input = latest_session.map(|s| s.input_tokens).unwrap_or(0);
+    let latest_output = latest_session.map(|s| s.output_tokens).unwrap_or(0);
+    let latest_cached = latest_session.map(|s| s.cached_input_tokens).unwrap_or(0);
+    let latest_context_window = latest_session.map(|s| s.context_window).unwrap_or(0);
+
+    let limits_age_secs = latest_timestamp.as_ref().and_then(|ts| {
+        let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+        let now = chrono::Utc::now();
+        let age = now.signed_duration_since(dt);
+        if age.num_seconds() > 0 {
+            Some(age.num_seconds() as u64)
+        } else {
+            Some(0)
+        }
+    });
+
+    Some(CodexSessionSnapshot {
+        total_input,
+        total_output,
+        total_cached,
+        total_reasoning,
+        context_window,
+        file_count: sessions.len(),
+        latest_timestamp,
+        limits_age_secs,
+        latest_input,
+        latest_output,
+        latest_cached,
+        latest_context_window,
+    })
+}
+
+#[allow(dead_code)]
 pub(crate) fn codex_import_diagnostics(cache: &CodexImportCache) -> CodexImportDiagnostics {
     cache.diagnostics.clone()
 }
@@ -367,37 +463,34 @@ fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) ->
     let reader = BufReader::new(file);
 
     match parse_codex_session_reader(reader) {
-        ParsedSessionContents::Parsed((
-            timestamp,
-            input_tokens,
-            output_tokens,
-            has_token_usage,
-            limits,
-        )) => ParsedSessionFile::Parsed(CachedCodexSession {
+        ParsedSessionContents::Parsed(data) => ParsedSessionFile::Parsed(CachedCodexSession {
             modified,
             file_len,
-            timestamp,
-            input_tokens,
-            output_tokens,
-            has_token_usage,
-            limits,
+            timestamp: data.timestamp,
+            input_tokens: data.input_tokens,
+            output_tokens: data.output_tokens,
+            cached_input_tokens: data.cached_input_tokens,
+            reasoning_output_tokens: data.reasoning_output_tokens,
+            context_window: data.context_window,
+            has_token_usage: data.has_token_usage,
+            limits: data.limits,
         }),
         ParsedSessionContents::NoUsageOrLimits => ParsedSessionFile::NoUsageOrLimits,
         ParsedSessionContents::ParseError => ParsedSessionFile::ParseError,
     }
 }
 
-fn parse_codex_session_contents(
-    contents: &str,
-) -> Option<(String, u64, u64, bool, Option<CodexRateLimits>)> {
+#[cfg(test)]
+fn parse_codex_session_contents(contents: &str) -> Option<CodexSessionData> {
     match parse_codex_session_contents_with_status(contents) {
         ParsedSessionContents::Parsed(parsed) => Some(parsed),
         ParsedSessionContents::NoUsageOrLimits | ParsedSessionContents::ParseError => None,
     }
 }
 
+#[cfg(test)]
 fn parse_codex_session_contents_with_status(contents: &str) -> ParsedSessionContents {
-    parse_codex_session_reader(Cursor::new(contents.as_bytes()))
+    parse_codex_session_reader(std::io::Cursor::new(contents.as_bytes()))
 }
 
 fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContents {
@@ -406,6 +499,9 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
     let mut latest_event_timestamp: Option<String> = None;
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cached_input_tokens: u64 = 0;
+    let mut reasoning_output_tokens: u64 = 0;
+    let mut context_window: u64 = 0;
     let mut has_token_usage = false;
     let mut latest_limits: Option<CodexRateLimits> = None;
     let mut line = String::new();
@@ -485,16 +581,22 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             });
         }
 
-        let maybe_total_usage = parsed_line
+        let maybe_info = parsed_line
             .payload
             .as_ref()
-            .and_then(|payload| payload.info.as_ref())
-            .and_then(|info| info.total_token_usage.as_ref());
+            .and_then(|payload| payload.info.as_ref());
 
-        if let Some(total_usage) = maybe_total_usage {
-            input_tokens = total_usage.input_tokens;
-            output_tokens = total_usage.output_tokens;
-            has_token_usage = true;
+        if let Some(info) = maybe_info {
+            if let Some(total_usage) = info.total_token_usage.as_ref() {
+                input_tokens = total_usage.input_tokens;
+                output_tokens = total_usage.output_tokens;
+                cached_input_tokens = total_usage.cached_input_tokens;
+                reasoning_output_tokens = total_usage.reasoning_output_tokens;
+                has_token_usage = true;
+            }
+            if let Some(window) = info.model_context_window {
+                context_window = window;
+            }
         }
     }
 
@@ -511,13 +613,16 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
         return ParsedSessionContents::NoUsageOrLimits;
     }
 
-    ParsedSessionContents::Parsed((
+    ParsedSessionContents::Parsed(CodexSessionData {
         timestamp,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
+        reasoning_output_tokens,
+        context_window,
         has_token_usage,
-        latest_limits,
-    ))
+        limits: latest_limits,
+    })
 }
 
 fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> CodexRateLimit {
@@ -556,19 +661,19 @@ mod tests {
 {"timestamp":"2026-02-16T09:45:53.237Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":8582,"output_tokens":210}}}}
 {"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17438,"output_tokens":326}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
-        assert_eq!(parsed.0, "2026-02-16T09:45:56.220Z");
-        assert_eq!(parsed.1, 17438);
-        assert_eq!(parsed.2, 326);
-        assert!(parsed.3);
-        assert!(parsed.4.is_none());
+        assert_eq!(parsed.timestamp, "2026-02-16T09:45:56.220Z");
+        assert_eq!(parsed.input_tokens, 17438);
+        assert_eq!(parsed.output_tokens, 326);
+        assert!(parsed.has_token_usage);
+        assert!(parsed.limits.is_none());
     }
 
     #[test]
     fn parses_codex_rate_limits() {
         let payload = r#"{"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17438,"output_tokens":326}},"rate_limits":{"primary":{"used_percent":7.0,"window_minutes":300,"resets_at":1771243734},"secondary":{"used_percent":25.0,"window_minutes":10080,"resets_at":1771317088}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
-        assert!(parsed.3);
-        let limits = parsed.4.expect("expected limits");
+        assert!(parsed.has_token_usage);
+        let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").window_minutes, 300);
         assert_eq!(limits.secondary.expect("secondary").window_minutes, 10080);
     }
@@ -577,7 +682,7 @@ mod tests {
     fn parses_codex_rate_limits_with_integer_percent() {
         let payload = r#"{"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":20}},"rate_limits":{"primary":{"used_percent":7,"window_minutes":300,"resets_at":1771243734}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
-        let limits = parsed.4.expect("expected limits");
+        let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 7.0);
     }
 
@@ -592,9 +697,9 @@ mod tests {
     fn parses_codex_rate_limits_when_info_is_null() {
         let payload = r#"{"timestamp":"2026-02-17T13:47:12.863Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":3.0,"window_minutes":300,"resets_at":1771348283},"secondary":{"used_percent":2.0,"window_minutes":10080,"resets_at":1771922246}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex limits");
-        assert_eq!(parsed.0, "2026-02-17T13:47:12.863Z");
-        assert!(!parsed.3);
-        let limits = parsed.4.expect("expected limits");
+        assert_eq!(parsed.timestamp, "2026-02-17T13:47:12.863Z");
+        assert!(!parsed.has_token_usage);
+        let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 3.0);
         assert_eq!(limits.secondary.expect("secondary").used_percent, 2.0);
     }
@@ -604,8 +709,8 @@ mod tests {
         let payload = r#"{"timestamp":"2026-02-17T13:47:00.000Z","type":"session_meta","payload":{"timestamp":"2026-02-17T13:47:00.000Z"}}
 {"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":6.0,"window_minutes":300,"resets_at":1771348283}}}}"#;
         let parsed = parse_codex_session_contents(payload).expect("expected codex limits");
-        assert_eq!(parsed.0, "2026-02-17T13:47:00.000Z");
-        let limits = parsed.4.expect("expected limits");
+        assert_eq!(parsed.timestamp, "2026-02-17T13:47:00.000Z");
+        let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 6.0);
     }
 
@@ -623,6 +728,9 @@ mod tests {
                 timestamp: "2026-02-18T00:00:00Z".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                context_window: 0,
                 has_token_usage: false,
                 limits: Some(CodexRateLimits {
                     timestamp: "2026-02-18T00:00:00Z".to_string(),
@@ -644,6 +752,9 @@ mod tests {
                 timestamp: "2026-02-17T23:59:59Z".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                context_window: 0,
                 has_token_usage: false,
                 limits: Some(CodexRateLimits {
                     timestamp: "2026-02-17T23:59:59Z".to_string(),
@@ -665,11 +776,11 @@ mod tests {
     fn parses_fixture_with_malformed_and_mixed_events() {
         let payload = fixture_contents("mixed_usage_and_limits.jsonl");
         let parsed = parse_codex_session_contents(&payload).expect("expected parsed fixture");
-        assert_eq!(parsed.0, "2026-02-18T10:01:10.000Z");
-        assert_eq!(parsed.1, 180);
-        assert_eq!(parsed.2, 55);
-        assert!(parsed.3);
-        let limits = parsed.4.expect("expected limits");
+        assert_eq!(parsed.timestamp, "2026-02-18T10:01:10.000Z");
+        assert_eq!(parsed.input_tokens, 180);
+        assert_eq!(parsed.output_tokens, 55);
+        assert!(parsed.has_token_usage);
+        let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 5.0);
         assert_eq!(limits.secondary.expect("secondary").used_percent, 3.0);
     }

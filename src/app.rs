@@ -10,22 +10,20 @@ use crossterm::terminal::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::claude_import::{merge_claude_usage, ClaudeImportDiagnostics};
-use crate::codex_import::{CodexImportCache, codex_import_diagnostics, merge_codex_usage};
+use crate::claude_import::{ClaudeImportDiagnostics, merge_claude_usage};
+use crate::codex_import::{CodexImportCache, merge_codex_usage};
 use crate::models::{
     AppConfig, UsageData, default_config_file, default_data_file, load_or_bootstrap_config,
-    load_or_bootstrap_data, provider_summaries,
+    load_or_bootstrap_data,
 };
 use crate::ui::draw;
 
+/// Live refresh cadence: 10s == 0.1 Hz, the monitoring rate PromptPetrol targets.
 pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(crate) struct App {
-    data_file: PathBuf,
-    config_file: PathBuf,
     pub(crate) config: AppConfig,
     pub(crate) data: UsageData,
-    pub(crate) selected_provider: Option<String>,
     pub(crate) status: String,
     pub(crate) codex_cache: CodexImportCache,
     pub(crate) claude_cache: ClaudeImportDiagnostics,
@@ -38,124 +36,40 @@ impl App {
         let mut data = load_or_bootstrap_data(&data_file, &config)?;
         let mut codex_cache = CodexImportCache::default();
         merge_codex_usage(&mut data, &config, &mut codex_cache);
-        
+
         let mut claude_cache = ClaudeImportDiagnostics::default();
-        if config.claude_oauth_token.is_some() {
-            merge_claude_usage(&mut data, &config, &mut claude_cache);
-        }
-        
-        let status = build_status_line(&config, &codex_cache, &claude_cache);
+        merge_claude_usage(&mut data, &config, &mut claude_cache);
+
+        let status = build_status_line(&codex_cache, &claude_cache);
         Ok(Self {
-            data_file,
-            config_file,
             config,
             data,
-            selected_provider: None,
             status,
             codex_cache,
             claude_cache,
             show_help: false,
-        }
-        .with_selected_provider())
+        })
     }
 
     pub(crate) fn reload(&mut self) {
-        match load_or_bootstrap_config(&self.config_file) {
-            Ok(config) => {
-                self.config = config;
-            }
-            Err(err) => {
-                self.status = format!("Reload failed: {err}");
-                return;
-            }
-        }
-
-        match load_or_bootstrap_data(&self.data_file, &self.config) {
-            Ok(mut data) => {
-                merge_codex_usage(&mut data, &self.config, &mut self.codex_cache);
-                if self.config.claude_oauth_token.is_some() {
-                    merge_claude_usage(&mut data, &self.config, &mut self.claude_cache);
-                }
-                self.data = data;
-                self.sync_selected_provider();
-                self.status = build_status_line(&self.config, &self.codex_cache, &self.claude_cache);
-            }
-            Err(err) => {
-                self.status = format!("Reload failed: {err}");
-            }
-        }
-    }
-
-    fn with_selected_provider(mut self) -> Self {
-        self.sync_selected_provider();
-        self
-    }
-
-    fn provider_names(&self) -> Vec<String> {
-        provider_summaries(&self.data)
-            .into_iter()
-            .map(|summary| summary.provider)
-            .collect()
-    }
-
-    fn sync_selected_provider(&mut self) {
-        let providers = self.provider_names();
-        if providers.is_empty() {
-            self.selected_provider = None;
-            return;
-        }
-
-        if let Some(selected) = self.selected_provider.as_ref()
-            && providers.iter().any(|name| name == selected)
+        if let Ok(path) = default_config_file()
+            && let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(config) = serde_json::from_str::<AppConfig>(&contents)
         {
-            return;
-        }
-        self.selected_provider = providers.first().cloned();
-    }
-
-    fn select_next_provider(&mut self) {
-        let providers = self.provider_names();
-        if providers.is_empty() {
-            self.selected_provider = None;
-            return;
+            self.config = config;
         }
 
-        let current = self
-            .selected_provider
-            .as_ref()
-            .and_then(|name| providers.iter().position(|p| p == name))
-            .unwrap_or(0);
-        let next = (current + 1) % providers.len();
-        self.selected_provider = providers.get(next).cloned();
-    }
-
-    fn select_prev_provider(&mut self) {
-        let providers = self.provider_names();
-        if providers.is_empty() {
-            self.selected_provider = None;
-            return;
+        if let Ok(mut data) = load_or_bootstrap_data_from_config(&self.config) {
+            merge_codex_usage(&mut data, &self.config, &mut self.codex_cache);
+            merge_claude_usage(&mut data, &self.config, &mut self.claude_cache);
+            self.data = data;
         }
 
-        let current = self
-            .selected_provider
-            .as_ref()
-            .and_then(|name| providers.iter().position(|p| p == name))
-            .unwrap_or(0);
-        let prev = if current == 0 {
-            providers.len() - 1
-        } else {
-            current - 1
-        };
-        self.selected_provider = providers.get(prev).cloned();
+        self.status = build_status_line(&self.codex_cache, &self.claude_cache);
     }
 
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
-        self.status = if self.show_help {
-            "Help opened".to_string()
-        } else {
-            "Help closed".to_string()
-        };
     }
 }
 
@@ -181,24 +95,6 @@ pub(crate) fn run(
                 Event::Key(key) if key.code == KeyCode::Char('r') => {
                     app.reload();
                     last_refresh = Instant::now();
-                }
-                Event::Key(key)
-                    if matches!(
-                        key.code,
-                        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k')
-                    ) =>
-                {
-                    app.select_prev_provider();
-                    app.status = "Selected previous provider".to_string();
-                }
-                Event::Key(key)
-                    if matches!(
-                        key.code,
-                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('j')
-                    ) =>
-                {
-                    app.select_next_provider();
-                    app.status = "Selected next provider".to_string();
                 }
                 Event::Key(key) if key.code == KeyCode::Char('?') => {
                     app.toggle_help();
@@ -244,40 +140,32 @@ pub(crate) fn bootstrap_app(
     App::new(data_file, config_file)
 }
 
-fn build_status_line(config: &AppConfig, cache: &CodexImportCache, claude_cache: &ClaudeImportDiagnostics) -> String {
+fn load_or_bootstrap_data_from_config(config: &AppConfig) -> Result<UsageData> {
+    let path = default_data_file()?;
+    load_or_bootstrap_data(&path, config)
+}
+
+fn build_status_line(cache: &CodexImportCache, claude_cache: &ClaudeImportDiagnostics) -> String {
     let mut parts = Vec::new();
-    
-    if config.codex_import.enabled {
-        let diagnostics = codex_import_diagnostics(cache);
-        let imported_ago_secs = diagnostics
-            .last_import_at
-            .and_then(|t| SystemTime::now().duration_since(t).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        parts.push(format!(
-            "Codex: {} files, {}s ago",
-            diagnostics.active_files,
-            imported_ago_secs
-        ));
+
+    if let Some(err) = &claude_cache.fetch_error {
+        parts.push(format!("Claude: {err}"));
+    } else if claude_cache.limits.is_some() {
+        parts.push(format!("Claude: 5h {:.1}%", claude_cache.five_hour_pct));
     }
-    
-    if config.claude_oauth_token.is_some() {
-        if let Some(err) = &claude_cache.fetch_error {
-            parts.push(format!("Claude: {}", err));
-        } else {
-            parts.push(format!(
-                "Claude: 5h {}/{}, 7d {}/{}",
-                claude_cache.five_hour_used,
-                claude_cache.five_hour_limit,
-                claude_cache.seven_day_used,
-                claude_cache.seven_day_limit
-            ));
-        }
+
+    let codex_ago = cache
+        .diagnostics
+        .last_import_at
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if cache.diagnostics.active_files > 0 {
+        parts.push(format!("Codex: {}s ago", codex_ago));
     }
-    
+
     if parts.is_empty() {
-        return "Ready".to_string();
+        return "Monitoring...".to_string();
     }
-    
     parts.join(" | ")
 }
