@@ -1,104 +1,122 @@
 # TODO
 
-- [x] Define MVP scope for PromptPetrol TUI
-- [x] Initialize Rust project with `cargo`
-- [x] Choose TUI stack (`ratatui` + `crossterm`)
-- [x] Design terminal layout (usage, cost, alerts, trends)
-- [x] Build baseline token usage ingestion pipeline (JSON file)
-- [x] Implement local persistence (JSON)
-- [x] Create interactive dashboard for usage and cost tracking
-- [x] Add budget alerts and threshold indicators
-- [x] Add realtime refresh loop for live token monitoring
-- [x] Add dynamic layout handling for variable terminal columns and rows
-- [x] Add provider adapters for OpenAI, Codex, Opus, Anthropic, Gemini, and other model providers
-- [x] Normalize provider usage into a common token/cost schema
-- [x] Add config support for API keys and model pricing
-- [x] Write setup and usage documentation
+This is the execution checklist for the research-backed
+[scaling plan](docs/SCALING_PLAN.md). Complete phases in order. A phase is not
+complete until its exit gate passes.
 
-- [x] Live codex limit tracking is not working
-- [x] Live tracking should refresh every 10 seconds i.e 0.1hz
+## S0 - Baseline And Contracts
 
-## Next improvements
+- [ ] S0.1 Define fixture profiles for 2,500 files, 10,000 files, 100 MiB cold ingest, and a 64 KiB append
+- [ ] S0.2 Replace the ignored wall-clock probe with Criterion benchmarks for discovery, cold ingest, warm refresh, append ingest, cache handoff, and rendering
+- [ ] S0.3 Record CPU time, wall time, peak memory, bytes read, and metadata calls on the reference macOS machine
+- [ ] S0.4 Add non-flaky CI smoke limits; keep statistical regression comparisons on controlled hardware
+- [ ] S0.5 Document the normalized `ProviderSnapshot`, `UsageWindow`, `ContextWindow`, and `SourceHealth` contracts
+- [ ] S0.6 Add fixture cases for a partial final JSONL line, truncation, replacement, clock regression, malformed append, and reset transition
 
-- [x] Split `src/main.rs` into modules (`app`, `ui`, `codex_import`, `models`) to reduce coupling and improve testability
-- [x] Add integration tests for Codex session import using fixture `.jsonl` files (including malformed lines and mixed event types)
-- [x] Add a large-session performance pass (benchmark + optimize recursive scan of `~/.codex/sessions`)
-- [x] Add optional debounce/backoff for auto-refresh when no files changed for extended periods
-- [x] Surface Codex import diagnostics in the UI status line (sessions read, parse failures, last import time)
-- [x] Add keyboard shortcut help panel in-app (toggle with `?`)
-- [x] Add CLI flags for `--data-file`, `--config-file`, and `--refresh-interval-seconds`
-- [x] Add export command for provider summaries (`json` and `csv`)
-- [x] Add CI workflow for `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`
-- [x] Expand README with troubleshooting for Codex import paths, permissions, and stale session data
+**Baseline:** the current release probe scanned 2,500 one-line files in 6.67 ms
+on 2026-08-19. It measures recursive discovery only, not metadata traversal,
+parsing, cache cloning, rendering, or 10,000-file behavior.
 
-## Scalability & future scope
+**Exit gate:** benchmark commands and fixture profiles are reproducible, and
+the provisional budgets in `docs/SCALING_PLAN.md` are either accepted or
+revised from measured data.
 
-### P0 - Correctness and observability
+## S1 - Source Trust
 
-- [x] Split Codex diagnostics into `parse_error_files`, `no_usage_or_limits_files`, and `unreadable_files`
-- [x] Add unit tests for diagnostics categorization and edge timestamp cases
-- [x] Add staleness/freshness indicator in UI info/alerts for Codex snapshot age
+- [ ] S1.1 Track last attempt, last success, source timestamp, snapshot age, refresh duration, consecutive failures, and next retry per source
+- [ ] S1.2 Add `LIVE`, `STALE`, `AUTH`, `RATE LIMITED`, `OFFLINE`, and `DISABLED` source states
+- [ ] S1.3 Keep last-known-good values visible on transient failures and mark them stale
+- [ ] S1.4 Show detailed, redacted source/config errors in the checklist view
+- [ ] S1.5 Inject the Claude HTTP transport and test 200, 401, 403, 429, 5xx, malformed JSON, connect timeout, and response timeout
+- [ ] S1.6 Parse both forms of `Retry-After` and add capped exponential backoff with deterministic jitter tests
+- [ ] S1.7 Use `Instant` for in-process deadlines and durations; reserve `SystemTime` for display and persisted timestamps
+- [ ] S1.8 Simplify terminal setup around Ratatui 0.30 initialization and verify cleanup on normal exit, error, and panic
+- [ ] S1.9 Validate live Claude and Codex data without storing or printing credentials
 
-### P1 - Parsing performance
+**Exit gate:** every displayed value communicates freshness, all HTTP/error
+classes have deterministic tests, and the terminal is restored through every
+tested exit path.
 
-- [x] Replace full-file `read_to_string` with streaming JSONL parsing (`BufRead`)
-- [x] Introduce typed partial structs for Codex events instead of generic `serde_json::Value`
-- [x] Parse only relevant event types quickly (`session_meta`, `event_msg/token_count`)
-- [ ] Add benchmarks for 10k+ files and very large session files
+## S2 - Snapshot And Runtime Boundary
 
-### P2 - Incremental ingest architecture
+- [ ] S2.1 Add provider-neutral domain types in a module that imports neither Codex nor Claude implementation types
+- [ ] S2.2 Make the UI consume a small immutable `UiSnapshot`, not importer caches
+- [ ] S2.3 Precompute latest context and rate-limit snapshots during ingest so rendering is O(1) in session count
+- [ ] S2.4 Replace per-refresh thread creation with persistent source workers and bounded command/result channels
+- [ ] S2.5 Keep the mutable Codex cache inside its worker; remove full-cache cloning from the UI thread
+- [ ] S2.6 Render immediately at startup in `ACQUIRING` state instead of performing synchronous network/filesystem work
+- [ ] S2.7 Reuse one configured Reqwest client inside the Claude worker
+- [ ] S2.8 Cache Keychain resolution and invalidate it on auth failure, config change, or manual credential refresh
+- [ ] S2.9 Give Codex, Claude, config reload, and full reconciliation independent deadlines
+- [ ] S2.10 Coalesce repeated manual refresh commands without dropping a required follow-up refresh
 
-- [ ] Add per-session cursor/index cache (`mtime`, `len`, `last_offset`, `last_event_ts`)
-- [ ] Implement append-only incremental parsing for changed files
-- [ ] Persist ingest index to disk to reduce cold-start rescans
-- [ ] Ensure stable dedupe/merge logic across repeated reload cycles
+**Exit gate:** no UI-thread operation is proportional to session count, startup
+paints before network completion, and source workers cannot create unbounded
+queues or overlapping requests.
 
-### P3 - Discovery scalability
+## S3 - Incremental Codex Ingest
 
-- [ ] Add optional filesystem watcher mode (`notify`) for session discovery
-- [ ] Keep recursive scan fallback when watcher is unavailable
-- [ ] Tune backoff strategy using activity and watcher health
+- [ ] S3.1 Split parser state from file I/O so the same state machine handles full and appended input
+- [ ] S3.2 Store last committed byte offset and retain an incomplete trailing line without advancing the cursor
+- [ ] S3.3 Parse only bytes appended after the committed offset
+- [ ] S3.4 Detect truncation, replacement, incompatible file identity, and source-directory changes and rebuild affected state
+- [ ] S3.5 Add stable deduplication for replayed events and idempotence tests across repeated refreshes
+- [ ] S3.6 Introduce `notify` as a change accelerator with event coalescing
+- [ ] S3.7 Trigger full reconciliation when `notify::Event::need_rescan()` is true
+- [ ] S3.8 Retain periodic recursive reconciliation and polling fallback for missed events, network filesystems, and watcher failure
+- [ ] S3.9 Stop issuing metadata calls for every historical file on every normal refresh
+- [ ] S3.10 Persist a versioned ingest index only after cursor recovery tests pass; write it transactionally
 
-### P4 - UI responsiveness and growth
+**Exit gate:** append work scales with appended bytes, watcher loss self-heals,
+and restart/truncation/replacement tests produce the same snapshot as a clean
+full parse.
 
-- [ ] Move import/parse work off the UI thread into a background worker
-- [ ] Render from immutable snapshots to avoid frame stalls
-- [ ] Add Codex trend mini-panel (5h/weekly history) once incremental ingest lands
-- [ ] Add pagination/virtualization if activity lists grow significantly
+## S4 - History And Forecasting
 
-## OpenAI-Codex usage/limit parity plan
+- [ ] S4.1 Approve history semantics: sample-on-change, heartbeat interval, retention, reset boundaries, and clock policy
+- [ ] S4.2 Add a versioned SQLite schema with migrations and uniqueness constraints
+- [ ] S4.3 Store normalized usage samples and source health only; never store prompts or raw session JSONL
+- [ ] S4.4 Measure default journal mode versus WAL before enabling WAL and define checkpoint behavior if selected
+- [ ] S4.5 Add retention compaction, database-size diagnostics, backup/export, and corruption recovery tests
+- [ ] S4.6 Calculate burn rate only from comparable samples inside the same provider window
+- [ ] S4.7 Add confidence-qualified forecasts for threshold crossing and projected utilization at reset
+- [ ] S4.8 Add trend/runway MFD page with honest insufficient-data and reset states
 
-### P0 - Correct provider/model identity for Codex sessions
+**Exit gate:** history survives restart and migration, duplicate samples are
+rejected, retention is bounded, and forecasts are suppressed when the sample
+quality is insufficient.
 
-- [ ] Parse and persist provider/model identity from Codex session metadata (e.g. `model_provider` and any model identifier fields)
-- [ ] Stop hard-forcing imported entries to `provider = "codex"`; map to actual provider when available (e.g. `openai`)
-- [ ] Replace default model fallback `"codex-cli"` with a more explicit fallback strategy (e.g. `unknown-codex-model`) and surface fallback use in diagnostics
-- [ ] Add tests with fixtures covering: provider present, model present, provider only, model only, neither present
+## S5 - Alerts And MFD Pages
 
-### P1 - Capture full token accounting from Codex events
+- [ ] S5.1 Add Summary, Trends, and Data Link pages with keyboard navigation and responsive full/medium/compact layouts
+- [ ] S5.2 Add configurable caution/critical thresholds with hysteresis
+- [ ] S5.3 Add alert cooldown and transition-based delivery to prevent repeated notifications
+- [ ] S5.4 Add alerts for stale data, authentication failure, unexpected reset, and counter regression
+- [ ] S5.5 Add golden buffer tests for every page at 120x40, 120x20, 60x20, 40x12, and minimum size
+- [ ] S5.6 Verify color and information hierarchy in true color, 256 color, and `NO_COLOR` modes
 
-- [ ] Extend Codex parser to read additional token fields beyond input/output (at minimum: `cached_input_tokens`, `reasoning_output_tokens`, and total token fields when present)
-- [ ] Define a clear normalization policy for totals (what counts as `total_tokens`, and how cached/reasoning are represented)
-- [ ] Update `UsageEntry`/aggregation to preserve both compatibility totals and expanded token breakdown
-- [ ] Add regression tests proving totals match real Codex JSONL samples with mixed token payload shapes (`info = null`, partial usage, full usage)
+**Exit gate:** alerts fire once per state transition, every page remains usable
+at supported breakpoints, and snapshots cover all data/source states.
 
-### P2 - Show limit usage for codex-derived models, not only `provider == "codex"`
+## S6 - Provider And Distribution Expansion
 
-- [ ] Decouple limit UI gating from strict provider string check; enable Codex limit widgets when selected provider/model is backed by Codex session import
-- [ ] Add explicit source metadata on imported entries so UI can reliably detect Codex-origin records even if provider is `openai`
-- [ ] Keep graceful fallback when no limits are available (`rate_limits` missing/null)
-- [ ] Add UI tests/snapshots for both cases: codex-origin OpenAI model and non-codex OpenAI model
+- [ ] S6.1 Add a provider adapter trait only when implementing a third real provider
+- [ ] S6.2 Keep billing/cost records separate from subscription-window utilization if spend tracking is approved
+- [ ] S6.3 Add platform-specific secure credential stores before claiming Linux or Windows credential support
+- [ ] S6.4 Produce reproducible release binaries, checksums, changelog, and Homebrew formula
+- [ ] S6.5 Add macOS signing/notarization and Linux terminal compatibility validation
+- [ ] S6.6 Consider daemon/remote-agent mode only after local worker, history, and security gates pass
 
-### P3 - Diagnostics, migration, and UX clarity
+**Exit gate:** each supported platform has tested installation, credential,
+terminal, upgrade, and uninstall paths.
 
-- [ ] Extend status line diagnostics to include: number of codex-origin entries, entries using fallback provider/model, and last limits timestamp
-- [ ] Add a one-time migration note in README/changelog explaining provider/model identity behavior change
-- [ ] Document token accounting semantics (input/output vs cached/reasoning) in README with examples from real Codex payloads
-- [ ] Add troubleshooting steps for “limits visible but token totals missing” and “token totals visible but limits missing”
+## Release Gates
 
-### P4 - Verification checklist (for PR acceptance)
-
-- [ ] Validate against real local `~/.codex/sessions` sample set (including sessions where `info` alternates between null and populated)
-- [ ] Confirm `openai-codex`-style sessions show both token usage and 5h/weekly limits in the dashboard
-- [ ] Run full quality gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`
-- [ ] Include before/after screenshots (or text snapshots) proving the fix for provider/model naming, token totals, and limit visibility
+- [x] `cargo fmt --check`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test --all-targets`
+- [x] Run ignored visual tests and the 2,500-file discovery probe
+- [x] Run `cargo audit` against the locked dependency graph
+- [ ] Complete S0 benchmark suite, including the real 10,000-file profile
+- [ ] Validate live Claude and Codex data on a real terminal
+- [ ] Capture full, medium, compact, and minimum-size release screenshots

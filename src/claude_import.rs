@@ -48,15 +48,20 @@ pub(crate) fn fetch_claude_usage(oauth_token: &str) -> Result<Option<ClaudeOAuth
         return Ok(None);
     }
 
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
+    let response = response.error_for_status()?;
     let usage: ClaudeOAuthUsage = response.json()?;
     Ok(Some(usage))
 }
 
 pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImportDiagnostics) {
+    if !config.claude_import.enabled {
+        *diagnostics = ClaudeImportDiagnostics {
+            fetch_error: Some("Disabled".into()),
+            ..Default::default()
+        };
+        return;
+    }
+
     let token = config
         .claude_oauth_token
         .as_deref()
@@ -126,4 +131,35 @@ fn parse_iso_to_epoch(iso: &Option<String>) -> Option<u64> {
     let s = iso.as_deref()?;
     let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
     Some(dt.timestamp() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_import_clears_stale_claude_data() {
+        let mut config = AppConfig::default();
+        config.claude_import.enabled = false;
+        let mut diagnostics = ClaudeImportDiagnostics {
+            five_hour_pct: 50.0,
+            seven_day_pct: 25.0,
+            limits: Some(CodexRateLimits {
+                timestamp: "2026-08-19T00:00:00Z".into(),
+                primary: Some(CodexRateLimit {
+                    used_percent: 50.0,
+                    resets_at: None,
+                }),
+                secondary: None,
+            }),
+            ..Default::default()
+        };
+
+        merge_claude_usage(&config, &mut diagnostics);
+
+        assert_eq!(diagnostics.fetch_error.as_deref(), Some("Disabled"));
+        assert!(diagnostics.limits.is_none());
+        assert_eq!(diagnostics.five_hour_pct, 0.0);
+        assert_eq!(diagnostics.seven_day_pct, 0.0);
+    }
 }

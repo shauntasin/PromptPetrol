@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -159,7 +159,7 @@ pub(crate) struct CodexRateLimits {
     pub(crate) secondary: Option<CodexRateLimit>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CodexImportCache {
     sessions: HashMap<PathBuf, CachedCodexSession>,
     pub(crate) latest_limits: Option<CodexRateLimits>,
@@ -167,6 +167,7 @@ pub(crate) struct CodexImportCache {
     last_discovery_at: Option<SystemTime>,
     session_discovery_interval: Duration,
     idle_discovery_cycles: u32,
+    source_dir: Option<PathBuf>,
     pub(crate) diagnostics: CodexImportDiagnostics,
 }
 
@@ -179,6 +180,7 @@ impl Default for CodexImportCache {
             last_discovery_at: None,
             session_discovery_interval: MIN_DISCOVERY_INTERVAL,
             idle_discovery_cycles: 0,
+            source_dir: None,
             diagnostics: CodexImportDiagnostics::default(),
         }
     }
@@ -210,10 +212,15 @@ impl CodexImportCache {
 
 pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache) {
     if !config.codex_import.enabled {
+        *cache = CodexImportCache::default();
         return;
     }
 
     let sessions_dir = codex_sessions_dir(config);
+    if cache.source_dir.as_ref() != Some(&sessions_dir) {
+        *cache = CodexImportCache::default();
+        cache.source_dir = Some(sessions_dir.clone());
+    }
     let mut changes_detected = false;
     let mut discovery_ran = false;
     if should_refresh_file_discovery(cache) {
@@ -273,7 +280,8 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
     }
 
     // Drop any cached session whose file is no longer discovered.
-    cache.sessions.retain(|path, _| files.contains(path));
+    let active_paths: HashSet<&PathBuf> = files.iter().collect();
+    cache.sessions.retain(|path, _| active_paths.contains(path));
     let active_count = files.len();
     cache.session_files = files;
     cache.latest_limits = find_latest_limits(&cache.sessions);
@@ -605,6 +613,8 @@ mod tests {
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
         assert!(parsed.has_token_usage);
         let limits = parsed.limits.expect("expected limits");
+        assert_eq!(limits.primary.expect("primary").used_percent, 7.0);
+        assert_eq!(limits.secondary.expect("secondary").used_percent, 25.0);
     }
 
     #[test]
@@ -827,6 +837,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn disabling_import_clears_cached_sessions_and_limits() {
+        let mut cache = CodexImportCache::with_test_context(100, 20, 10, 200);
+        cache.latest_limits = Some(CodexRateLimits {
+            timestamp: "2026-08-19T00:00:00Z".into(),
+            primary: Some(CodexRateLimit {
+                used_percent: 50.0,
+                resets_at: None,
+            }),
+            secondary: None,
+        });
+        let mut config = AppConfig::default();
+        config.codex_import.enabled = false;
+
+        merge_codex_usage(&config, &mut cache);
+
+        assert!(codex_session_snapshot(&cache).is_none());
+        assert!(cache.latest_limits.is_none());
+        assert!(cache.session_files.is_empty());
+        assert!(cache.source_dir.is_none());
+    }
+
+    #[test]
+    fn changing_sessions_directory_invalidates_cache_immediately() {
+        let root = make_temp_dir("source-switch");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).expect("create first source");
+        fs::create_dir_all(&second).expect("create second source");
+        write_token_session(&first.join("session.jsonl"), 100);
+        write_token_session(&second.join("session.jsonl"), 900);
+
+        let mut config = AppConfig::default();
+        config.codex_import.sessions_dir = Some(first.to_string_lossy().into_owned());
+        let mut cache = CodexImportCache::default();
+        merge_codex_usage(&config, &mut cache);
+        assert_eq!(
+            codex_session_snapshot(&cache)
+                .expect("first source snapshot")
+                .latest_input,
+            100
+        );
+
+        config.codex_import.sessions_dir = Some(second.to_string_lossy().into_owned());
+        merge_codex_usage(&config, &mut cache);
+        assert_eq!(
+            codex_session_snapshot(&cache)
+                .expect("second source snapshot")
+                .latest_input,
+            900
+        );
+
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
     fn fixture_contents(name: &str) -> String {
         fs::read_to_string(fixture_path(name)).expect("read fixture file")
     }
@@ -835,6 +900,13 @@ mod tests {
         let contents = fixture_contents(fixture_name);
         let target = target_dir.join(fixture_name);
         fs::write(target, contents).expect("write fixture");
+    }
+
+    fn write_token_session(path: &Path, input_tokens: u64) {
+        let contents = format!(
+            r#"{{"timestamp":"2026-08-19T00:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input_tokens},"output_tokens":10}},"model_context_window":1000}}}}}}"#
+        );
+        fs::write(path, contents).expect("write token session");
     }
 
     fn fixture_path(name: &str) -> PathBuf {
