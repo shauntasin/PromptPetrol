@@ -20,7 +20,7 @@ Created automatically on first run. Unknown fields are ignored for backward comp
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `theme` | `string` | `murphy` | Color theme: `murphy`, `paper`, `arctic`, or `solarized-light` |
+| `theme` | `string` | `murphy` | Color theme: `murphy`, `dracula`, `nord`, `gruvbox`, `tokyo-night`, `paper`, `arctic`, or `solarized-light` |
 | `codex_import.enabled` | `bool` | `true` | Enable/disable Codex session import |
 | `codex_import.sessions_dir` | `string \| null` | `null` | Custom path to Codex sessions directory (default: `~/.codex/sessions`) |
 | `claude_import.enabled` | `bool` | `true` | Enable/disable Keychain discovery and Claude API fetching |

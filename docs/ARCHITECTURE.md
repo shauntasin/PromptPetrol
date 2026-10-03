@@ -81,9 +81,11 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
   - Two-column odometer bars (Claude left, Codex right)
   - Single-column fallback for very narrow terminals
   - Full-width context bar at bottom when data available
-- **Color coding**: Murphy green (< 70%), orange (70–90%), red (> 90%)
-- **Theme**: Neovim Murphy true-color palette with green, cyan, yellow, orange,
-  magenta, white, dark-green, and gray semantic tokens
+- **Color coding**: each palette maps nominal, caution, critical, unavailable,
+  and diagnostic states to distinct semantic colors
+- **Themes**: eight true-color palettes — Murphy, Dracula, Nord, Gruvbox, Tokyo
+  Night, Paper, Arctic, and Solarized Light — with a raised panel surface for
+  visual hierarchy
 - **Help overlay**: centered modal with keyboard shortcuts
 
 ### `codex_import.rs` (Codex session parser)

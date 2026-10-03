@@ -370,9 +370,9 @@ mod tests {
 
         assert_eq!(app.active_theme(), Theme::Murphy);
         app.cycle_theme();
-        assert_eq!(app.active_theme(), Theme::Paper);
+        assert_eq!(app.active_theme(), Theme::Dracula);
         app.config.theme = Theme::Arctic;
-        assert_eq!(app.active_theme(), Theme::Paper);
+        assert_eq!(app.active_theme(), Theme::Dracula);
     }
 
     fn temp_path(label: &str) -> PathBuf {

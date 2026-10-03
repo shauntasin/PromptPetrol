@@ -12,8 +12,9 @@ session's context scope.
 - Active Codex context-window usage from the latest session.
 - Full and medium avionics MFD layouts, including a dedicated 120×20 display mode.
 - Compact odometer bars on narrower terminals.
-- Four palettes across full and compact display modes: Murphy, Paper, Arctic,
-  and Solarized Light. The latter three are light themes.
+- Eight palettes across full and compact display modes: Murphy, Dracula, Nord,
+  Gruvbox, Tokyo Night, Paper, Arctic, and Solarized Light. Paper, Arctic, and
+  Solarized Light are light themes.
 - A 2 Hz render loop separated from the configurable data-refresh interval.
 - Immediate first paint with data acquisition running in the background.
 - Incremental in-memory caching of unchanged Codex session files.
@@ -80,9 +81,10 @@ on Unix because it may contain an OAuth token.
 }
 ```
 
-- `theme`: selects `murphy`, `paper`, `arctic`, or `solarized-light`. Murphy is
-  the default when the field is omitted. Pressing `t` temporarily overrides the
-  configured theme until PromptPetrol exits.
+- `theme`: selects `murphy`, `dracula`, `nord`, `gruvbox`, `tokyo-night`,
+  `paper`, `arctic`, or `solarized-light`. Murphy is the default when the field
+  is omitted. Pressing `t` temporarily overrides the configured theme until
+  PromptPetrol exits.
 - `codex_import.enabled`: enables local Codex session ingestion.
 - `codex_import.sessions_dir`: overrides the default `~/.codex/sessions` path.
 - `claude_import.enabled`: enables Claude credential discovery and API fetching.

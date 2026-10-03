@@ -26,6 +26,10 @@ pub(crate) struct AppConfig {
 pub(crate) enum Theme {
     #[default]
     Murphy,
+    Dracula,
+    Nord,
+    Gruvbox,
+    TokyoNight,
     Paper,
     Arctic,
     #[serde(alias = "solarized")]
@@ -35,8 +39,12 @@ pub(crate) enum Theme {
 impl Theme {
     pub(crate) const fn next(self) -> Self {
         match self {
-            Self::Murphy => Self::Paper,
+            Self::Murphy => Self::Dracula,
             Self::Paper => Self::Arctic,
+            Self::Dracula => Self::Nord,
+            Self::Nord => Self::Gruvbox,
+            Self::Gruvbox => Self::TokyoNight,
+            Self::TokyoNight => Self::Paper,
             Self::Arctic => Self::SolarizedLight,
             Self::SolarizedLight => Self::Murphy,
         }
@@ -45,6 +53,10 @@ impl Theme {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Murphy => "MURPHY",
+            Self::Dracula => "DRACULA",
+            Self::Nord => "NORD",
+            Self::Gruvbox => "GRUVBOX",
+            Self::TokyoNight => "TOKYO NIGHT",
             Self::Paper => "PAPER",
             Self::Arctic => "ARCTIC",
             Self::SolarizedLight => "SOLARIZED LIGHT",
@@ -197,6 +209,10 @@ mod tests {
         assert_eq!(default.theme, Theme::Murphy);
 
         for (name, expected) in [
+            ("dracula", Theme::Dracula),
+            ("nord", Theme::Nord),
+            ("gruvbox", Theme::Gruvbox),
+            ("tokyo-night", Theme::TokyoNight),
             ("paper", Theme::Paper),
             ("arctic", Theme::Arctic),
             ("solarized-light", Theme::SolarizedLight),

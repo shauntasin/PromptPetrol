@@ -18,6 +18,7 @@ const APP_NAME: &str = "PromptPetrol";
 #[derive(Clone, Copy)]
 struct Palette {
     background: Color,
+    surface: Color,
     normal: Color,
     separator: Color,
     accent: Color,
@@ -33,6 +34,7 @@ struct Palette {
 // Neovim's built-in Murphy palette, resolved from the active highlight groups.
 const MURPHY: Palette = Palette {
     background: Color::Rgb(0, 0, 0),
+    surface: Color::Rgb(8, 16, 10),
     normal: Color::Rgb(135, 255, 135),
     separator: Color::Rgb(0, 95, 0),
     accent: Color::Rgb(0, 255, 255),
@@ -45,8 +47,69 @@ const MURPHY: Palette = Palette {
     critical: Color::Rgb(255, 0, 0),
 };
 
+const DRACULA: Palette = Palette {
+    background: Color::Rgb(40, 42, 54),
+    surface: Color::Rgb(48, 51, 65),
+    normal: Color::Rgb(80, 250, 123),
+    separator: Color::Rgb(68, 71, 90),
+    accent: Color::Rgb(139, 233, 253),
+    label: Color::Rgb(241, 250, 140),
+    warning: Color::Rgb(255, 184, 108),
+    decorative: Color::Rgb(189, 147, 249),
+    text: Color::Rgb(248, 248, 242),
+    muted: Color::Rgb(184, 184, 196),
+    dim: Color::Rgb(98, 114, 164),
+    critical: Color::Rgb(255, 85, 85),
+};
+
+const NORD: Palette = Palette {
+    background: Color::Rgb(46, 52, 64),
+    surface: Color::Rgb(59, 66, 82),
+    normal: Color::Rgb(163, 190, 140),
+    separator: Color::Rgb(76, 86, 106),
+    accent: Color::Rgb(136, 192, 208),
+    label: Color::Rgb(235, 203, 139),
+    warning: Color::Rgb(208, 135, 112),
+    decorative: Color::Rgb(180, 142, 173),
+    text: Color::Rgb(236, 239, 244),
+    muted: Color::Rgb(216, 222, 233),
+    dim: Color::Rgb(97, 110, 136),
+    critical: Color::Rgb(191, 97, 106),
+};
+
+const GRUVBOX: Palette = Palette {
+    background: Color::Rgb(40, 40, 40),
+    surface: Color::Rgb(50, 48, 47),
+    normal: Color::Rgb(184, 187, 38),
+    separator: Color::Rgb(80, 73, 69),
+    accent: Color::Rgb(131, 165, 152),
+    label: Color::Rgb(250, 189, 47),
+    warning: Color::Rgb(254, 128, 25),
+    decorative: Color::Rgb(211, 134, 155),
+    text: Color::Rgb(235, 219, 178),
+    muted: Color::Rgb(189, 174, 147),
+    dim: Color::Rgb(102, 92, 84),
+    critical: Color::Rgb(251, 73, 52),
+};
+
+const TOKYO_NIGHT: Palette = Palette {
+    background: Color::Rgb(26, 27, 38),
+    surface: Color::Rgb(36, 40, 59),
+    normal: Color::Rgb(158, 206, 106),
+    separator: Color::Rgb(59, 66, 97),
+    accent: Color::Rgb(125, 207, 255),
+    label: Color::Rgb(224, 175, 104),
+    warning: Color::Rgb(255, 158, 100),
+    decorative: Color::Rgb(187, 154, 247),
+    text: Color::Rgb(192, 202, 245),
+    muted: Color::Rgb(121, 130, 169),
+    dim: Color::Rgb(86, 95, 137),
+    critical: Color::Rgb(247, 118, 142),
+};
+
 const PAPER: Palette = Palette {
     background: Color::Rgb(247, 243, 232),
+    surface: Color::Rgb(255, 250, 240),
     normal: Color::Rgb(23, 107, 69),
     separator: Color::Rgb(177, 197, 185),
     accent: Color::Rgb(0, 100, 112),
@@ -61,6 +124,7 @@ const PAPER: Palette = Palette {
 
 const ARCTIC: Palette = Palette {
     background: Color::Rgb(243, 247, 251),
+    surface: Color::Rgb(234, 241, 247),
     normal: Color::Rgb(11, 110, 79),
     separator: Color::Rgb(178, 199, 210),
     accent: Color::Rgb(0, 91, 145),
@@ -75,6 +139,7 @@ const ARCTIC: Palette = Palette {
 
 const SOLARIZED_LIGHT: Palette = Palette {
     background: Color::Rgb(253, 246, 227),
+    surface: Color::Rgb(238, 232, 213),
     normal: Color::Rgb(92, 116, 0),
     separator: Color::Rgb(147, 161, 161),
     accent: Color::Rgb(25, 130, 122),
@@ -90,6 +155,10 @@ const SOLARIZED_LIGHT: Palette = Palette {
 const fn palette_for(theme: Theme) -> Palette {
     match theme {
         Theme::Murphy => MURPHY,
+        Theme::Dracula => DRACULA,
+        Theme::Nord => NORD,
+        Theme::Gruvbox => GRUVBOX,
+        Theme::TokyoNight => TOKYO_NIGHT,
         Theme::Paper => PAPER,
         Theme::Arctic => ARCTIC,
         Theme::SolarizedLight => SOLARIZED_LIGHT,
@@ -332,7 +401,7 @@ fn render_mfd_header(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
                 Span::styled(secondary.2, Style::default().fg(palette.warning)),
             ]),
         ])
-        .style(Style::default().bg(palette.background)),
+        .style(Style::default().bg(palette.surface)),
         area,
     );
 }
@@ -351,9 +420,12 @@ fn render_provider_bay(
         .borders(Borders::ALL)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.separator))
-        .style(Style::default().bg(palette.background))
+        .style(Style::default().bg(palette.surface))
         .title(Line::from(vec![
-            Span::styled("◆ ", Style::default().fg(palette.decorative)),
+            Span::styled(
+                provider_icon(provider),
+                Style::default().fg(palette.decorative),
+            ),
             Span::styled(
                 provider,
                 Style::default()
@@ -417,9 +489,12 @@ fn render_medium_provider_bay(
         .borders(Borders::ALL)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.separator))
-        .style(Style::default().bg(palette.background))
+        .style(Style::default().bg(palette.surface))
         .title(Line::from(vec![
-            Span::styled("◆ ", Style::default().fg(palette.decorative)),
+            Span::styled(
+                provider_icon(provider),
+                Style::default().fg(palette.decorative),
+            ),
             Span::styled(
                 provider,
                 Style::default()
@@ -475,7 +550,7 @@ fn render_medium_metric(
         .borders(Borders::TOP)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.separator))
-        .style(Style::default().bg(palette.background))
+        .style(Style::default().bg(palette.surface))
         .title(Line::styled(
             format!(" {label} "),
             Style::default().fg(palette.label),
@@ -545,7 +620,7 @@ fn render_metric_instrument(
         .borders(Borders::TOP)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.separator))
-        .style(Style::default().bg(palette.background))
+        .style(Style::default().bg(palette.surface))
         .title(Line::styled(
             format!(" {label} "),
             Style::default().fg(palette.label),
@@ -621,10 +696,10 @@ fn render_context_scope(
         .borders(Borders::ALL)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.normal))
-        .style(Style::default().bg(palette.background))
+        .style(Style::default().bg(palette.surface))
         .title(
             Line::styled(
-                " ◇ CONTEXT // ACTIVE SESSION ",
+                " ◉ CONTEXT // ACTIVE SESSION ",
                 Style::default()
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD),
@@ -654,7 +729,7 @@ fn render_context_scope(
     };
     frame.render_widget(Clear, center);
     frame.render_widget(
-        Block::default().style(Style::default().bg(palette.background)),
+        Block::default().style(Style::default().bg(palette.surface)),
         center,
     );
 
@@ -689,7 +764,7 @@ fn render_context_scope(
         ],
     };
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(palette.background)),
+        Paragraph::new(lines).style(Style::default().bg(palette.surface)),
         center,
     );
 }
@@ -700,7 +775,7 @@ fn draw_context_scope(ctx: &mut CanvasContext, pct: f64, color: Color, palette: 
     for i in 0..steps {
         let a = (-90.0 + i as f64 / steps as f64 * 360.0).to_radians();
         let b = (-90.0 + (i + 1) as f64 / steps as f64 * 360.0).to_radians();
-        let segment_color = if i as f64 / steps as f64 <= ratio {
+        let segment_color = if (i as f64 / steps as f64) < ratio {
             color
         } else {
             palette.separator
@@ -757,6 +832,23 @@ fn render_rail(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
     frame.render_widget(Paragraph::new(rail), area);
 }
 
+fn provider_icon(provider: &str) -> &'static str {
+    match provider {
+        "CLAUDE" => "◈",
+        "CODEX" => "◇",
+        _ => "◆",
+    }
+}
+
+fn system_icon(state: &str) -> &'static str {
+    match state {
+        "FAULT" => "✖",
+        "DEGRADED" => "▲",
+        "ACQUIRING" => "◒",
+        _ => "●",
+    }
+}
+
 fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Palette) {
     let diagnostics = &app.codex_cache.diagnostics;
     let errors = diagnostics.parse_error_files
@@ -784,7 +876,7 @@ fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
         .borders(Borders::TOP)
         .border_set(border::PLAIN)
         .border_style(Style::default().fg(palette.separator))
-        .style(Style::default().bg(palette.background));
+        .style(Style::default().bg(palette.surface));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -804,7 +896,10 @@ fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("▰ ", Style::default().fg(state_color)),
+                Span::styled(
+                    format!("{} ", system_icon(system_state)),
+                    Style::default().fg(state_color),
+                ),
                 Span::styled(
                     truncate(&status, inner.width as usize),
                     Style::default().fg(state_color),
@@ -1343,7 +1438,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>, palette: Palette) {
     frame.render_widget(Clear, overlay);
     frame.render_widget(
         Paragraph::new(help_lines)
-            .style(Style::default().bg(palette.background))
+            .style(Style::default().bg(palette.surface))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1439,6 +1534,10 @@ mod tests {
     fn every_theme_renders_its_palette_in_full_and_compact_layouts() {
         for theme in [
             Theme::Murphy,
+            Theme::Dracula,
+            Theme::Nord,
+            Theme::Gruvbox,
+            Theme::TokyoNight,
             Theme::Paper,
             Theme::Arctic,
             Theme::SolarizedLight,
