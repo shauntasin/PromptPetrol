@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
-use color_eyre::Result;
+use color_eyre::eyre::{Result, eyre};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use crate::codex_import::{CodexRateLimit, CodexRateLimits};
@@ -8,9 +9,7 @@ use crate::models::AppConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClaudeOAuthUsage {
-    #[serde(rename = "five_hour")]
     pub(crate) five_hour: ClaudeUsageWindow,
-    #[serde(rename = "seven_day")]
     pub(crate) seven_day: ClaudeUsageWindow,
 }
 
@@ -24,6 +23,7 @@ pub(crate) struct ClaudeUsageWindow {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeImportDiagnostics {
+    client: Option<Client>,
     pub(crate) last_fetch_at: Option<SystemTime>,
     pub(crate) fetch_error: Option<String>,
     pub(crate) five_hour_pct: f64,
@@ -31,17 +31,24 @@ pub(crate) struct ClaudeImportDiagnostics {
     pub(crate) limits: Option<CodexRateLimits>,
 }
 
-pub(crate) fn fetch_claude_usage(oauth_token: &str) -> Result<Option<ClaudeOAuthUsage>> {
-    let client = reqwest::blocking::Client::builder()
+fn build_client() -> Result<Client> {
+    Ok(Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+        .build()?)
+}
 
+fn fetch_claude_usage(
+    client: &Client,
+    url: &str,
+    oauth_token: &str,
+) -> Result<Option<ClaudeOAuthUsage>> {
     let response = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {}", oauth_token))
+        .get(url)
+        .bearer_auth(oauth_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", "claude-code/0.1")
-        .header("Content-Type", "application/json")
         .send()?;
 
     if response.status() == 401 || response.status() == 403 {
@@ -49,8 +56,21 @@ pub(crate) fn fetch_claude_usage(oauth_token: &str) -> Result<Option<ClaudeOAuth
     }
 
     let response = response.error_for_status()?;
+    if !response.status().is_success() {
+        return Err(eyre!("unexpected HTTP status: {}", response.status()));
+    }
     let usage: ClaudeOAuthUsage = response.json()?;
+    validate_usage(&usage)?;
     Ok(Some(usage))
+}
+
+fn validate_usage(usage: &ClaudeOAuthUsage) -> Result<()> {
+    for value in [usage.five_hour.utilization, usage.seven_day.utilization] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(eyre!("API returned invalid utilization"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImportDiagnostics) {
@@ -65,6 +85,7 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
     let token = config
         .claude_oauth_token
         .as_deref()
+        .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
         .or_else(detect_claude_token);
@@ -81,7 +102,25 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
         resets_at: parse_iso_to_epoch(&w.resets_at),
     };
 
-    match fetch_claude_usage(&oauth_token) {
+    let client = match diagnostics.client.clone() {
+        Some(client) => client,
+        None => match build_client() {
+            Ok(client) => {
+                diagnostics.client = Some(client.clone());
+                client
+            }
+            Err(error) => {
+                diagnostics.fetch_error = Some(format!("Client error: {error}"));
+                return;
+            }
+        },
+    };
+
+    match fetch_claude_usage(
+        &client,
+        "https://api.anthropic.com/api/oauth/usage",
+        &oauth_token,
+    ) {
         Ok(Some(usage)) => {
             diagnostics.last_fetch_at = Some(SystemTime::now());
             diagnostics.fetch_error = None;
@@ -102,6 +141,7 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
     }
 }
 
+#[cfg(target_os = "macos")]
 fn detect_claude_token() -> Option<String> {
     let output = std::process::Command::new("security")
         .args([
@@ -127,10 +167,15 @@ fn detect_claude_token() -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
+fn detect_claude_token() -> Option<String> {
+    None
+}
+
 fn parse_iso_to_epoch(iso: &Option<String>) -> Option<u64> {
     let s = iso.as_deref()?;
     let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
-    Some(dt.timestamp() as u64)
+    dt.timestamp().try_into().ok()
 }
 
 #[cfg(test)]
@@ -161,5 +206,15 @@ mod tests {
         assert!(diagnostics.limits.is_none());
         assert_eq!(diagnostics.five_hour_pct, 0.0);
         assert_eq!(diagnostics.seven_day_pct, 0.0);
+    }
+
+    #[test]
+    fn reset_timestamps_reject_invalid_and_pre_epoch_values() {
+        assert_eq!(parse_iso_to_epoch(&None), None);
+        assert_eq!(parse_iso_to_epoch(&Some("not a timestamp".into())), None);
+        assert_eq!(
+            parse_iso_to_epoch(&Some("1960-01-01T00:00:00Z".into())),
+            None
+        );
     }
 }

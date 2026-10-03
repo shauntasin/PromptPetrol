@@ -38,12 +38,12 @@ cargo test --all-targets
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| `ui.rs` | 9 tests | Rendering at multiple terminal sizes, drum alignment, full and medium MFD layouts |
-| `codex_import.rs` | 15 tests | JSONL parsing, fixture integration, cache transitions, backoff, diagnostics |
-| `app.rs` | 3 tests | Config reload authority, invalid config retention, background refresh |
-| `models.rs` | 2 tests | Nested config bootstrap and private Unix permissions |
+| `ui.rs` | 10 tests | Rendering at multiple terminal sizes, drum alignment, full and medium MFD layouts |
+| `codex_import.rs` | 16 tests | JSONL parsing, fixture integration, cache transitions, backoff, diagnostics |
+| `app.rs` | 4 tests | Config reload authority, invalid config retention, background refresh, theme state |
+| `models.rs` | 4 tests | Nested config bootstrap, minimal defaults, theme defaults, and private Unix permissions |
 | `main.rs` | 3 tests | CLI parsing, help/version, invalid intervals |
-| `claude_import.rs` | 1 test | Disabled-import state reset |
+| `claude_import.rs` | 2 tests | Disabled-import state reset and timestamp validation |
 
 ### Test Fixtures
 
@@ -67,7 +67,7 @@ cargo test -- --include-ignored  # run all tests
 ```bash
 cargo fmt --check                  # check formatting
 cargo fmt                          # auto-format
-cargo clippy --all-targets -- -D warnings   # lint (warnings are errors)
+cargo clippy --all-targets --locked -- -D warnings   # lint (warnings are errors)
 ```
 
 ## CI Pipeline
@@ -75,8 +75,8 @@ cargo clippy --all-targets -- -D warnings   # lint (warnings are errors)
 Defined in `.github/workflows/ci.yml`. Runs on push to `main` and all PRs:
 
 1. `cargo fmt --check`
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test --all-targets`
+2. `cargo clippy --all-targets --locked -- -D warnings`
+3. `cargo test --all-targets --locked`
 
 Uses `dtolnay/rust-toolchain@stable` with `rustfmt` and `clippy` components, plus `Swatinem/rust-cache@v2` for dependency caching.
 

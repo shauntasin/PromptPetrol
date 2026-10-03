@@ -1,8 +1,8 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use color_eyre::Result;
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::{Deserialize, Serialize};
 
 /// Persistent configuration loaded from `config.json`. Unknown fields are
@@ -16,6 +16,7 @@ pub(crate) struct AppConfig {
     #[serde(default)]
     pub(crate) claude_import: ClaudeImportConfig,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) claude_oauth_token: Option<String>,
 }
 
@@ -56,6 +57,7 @@ pub(crate) struct CodexImportConfig {
     #[serde(default = "default_true")]
     pub(crate) enabled: bool,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sessions_dir: Option<String>,
 }
 
@@ -85,36 +87,47 @@ fn default_true() -> bool {
 }
 
 pub(crate) fn default_config_file() -> Result<PathBuf> {
-    Ok(default_config_base_dir()?.join("config.json"))
+    let base_dir = default_config_base_dir()?;
+    fs::create_dir_all(&base_dir)?;
+    set_private_directory_permissions(&base_dir)?;
+    Ok(base_dir.join("config.json"))
 }
 
 fn default_config_base_dir() -> Result<PathBuf> {
-    let base_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("promptpetrol");
-    fs::create_dir_all(&base_dir)?;
-    Ok(base_dir)
+    Ok(dirs::config_dir()
+        .ok_or_else(|| eyre!("cannot determine config directory; use --config-file"))?
+        .join("promptpetrol"))
 }
 
 pub(crate) fn load_or_bootstrap_config(path: &Path) -> Result<AppConfig> {
-    if path.exists() {
-        let config = serde_json::from_str(&fs::read_to_string(path)?)?;
-        set_private_permissions(path)?;
-        Ok(config)
-    } else {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
+    load_config(path).wrap_err_with(|| format!("failed to load config {}", path.display()))
+}
+
+fn load_config(path: &Path) -> Result<AppConfig> {
+    match File::open(path) {
+        Ok(file) => return read_private_config(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
+        set_private_directory_permissions(parent)?;
+    }
+    let seeded = AppConfig::default();
+    match write_private_config(path, &serde_json::to_string_pretty(&seeded)?) {
+        Ok(()) => Ok(seeded),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_private_config(File::open(path)?)
         }
-        let seeded = AppConfig::default();
-        write_private_config(path, &serde_json::to_string_pretty(&seeded)?)?;
-        Ok(seeded)
+        Err(error) => Err(error.into()),
     }
 }
 
-fn write_private_config(path: &Path, contents: &str) -> Result<()> {
+fn write_private_config(path: &Path, contents: &str) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
 
@@ -126,20 +139,37 @@ fn write_private_config(path: &Path, contents: &str) -> Result<()> {
 
     let mut file = options.open(path)?;
     file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn read_private_config(file: File) -> Result<AppConfig> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(eyre!("config path is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(serde_json::from_reader(file)?)
 }
 
 #[cfg(test)]
@@ -176,6 +206,14 @@ mod tests {
                 serde_json::from_str(&format!(r#"{{"theme":"{name}"}}"#)).expect("named theme");
             assert_eq!(config.theme, expected);
         }
+    }
+
+    #[test]
+    fn default_config_serializes_without_unset_optional_fields() {
+        let value = serde_json::to_value(AppConfig::default()).expect("serialize default config");
+
+        assert!(value.get("claude_oauth_token").is_none());
+        assert!(value["codex_import"].get("sessions_dir").is_none());
     }
 
     #[cfg(unix)]

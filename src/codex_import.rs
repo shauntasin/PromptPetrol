@@ -3,7 +3,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize;
 
@@ -27,7 +27,6 @@ struct CachedCodexSession {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct CodexImportDiagnostics {
     pub(crate) active_files: usize,
     pub(crate) refreshed_files: usize,
@@ -36,6 +35,7 @@ pub(crate) struct CodexImportDiagnostics {
     pub(crate) unreadable_files: usize,
     pub(crate) last_import_at: Option<SystemTime>,
     pub(crate) discovery_interval: Duration,
+    pub(crate) discovery_error: Option<String>,
 }
 
 impl Default for CodexImportDiagnostics {
@@ -48,6 +48,7 @@ impl Default for CodexImportDiagnostics {
             unreadable_files: 0,
             last_import_at: None,
             discovery_interval: MIN_DISCOVERY_INTERVAL,
+            discovery_error: None,
         }
     }
 }
@@ -125,25 +126,9 @@ struct CodexEventRateLimits {
 
 #[derive(Debug, Deserialize)]
 struct CodexRawRateLimit {
-    used_percent: CodexRateLimitPercent,
+    used_percent: f64,
     #[serde(default)]
     resets_at: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum CodexRateLimitPercent {
-    Float(f64),
-    Int(u64),
-}
-
-impl CodexRateLimitPercent {
-    fn as_f64(&self) -> f64 {
-        match self {
-            Self::Float(value) => *value,
-            Self::Int(value) => *value as f64,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,8 +148,9 @@ pub(crate) struct CodexRateLimits {
 pub(crate) struct CodexImportCache {
     sessions: HashMap<PathBuf, CachedCodexSession>,
     pub(crate) latest_limits: Option<CodexRateLimits>,
+    latest_session: Option<CodexSessionSnapshot>,
     session_files: Vec<PathBuf>,
-    last_discovery_at: Option<SystemTime>,
+    last_discovery_at: Option<Instant>,
     session_discovery_interval: Duration,
     idle_discovery_cycles: u32,
     source_dir: Option<PathBuf>,
@@ -176,12 +162,28 @@ impl Default for CodexImportCache {
         Self {
             sessions: HashMap::new(),
             latest_limits: None,
+            latest_session: None,
             session_files: Vec::new(),
             last_discovery_at: None,
             session_discovery_interval: MIN_DISCOVERY_INTERVAL,
             idle_discovery_cycles: 0,
             source_dir: None,
             diagnostics: CodexImportDiagnostics::default(),
+        }
+    }
+}
+
+impl CodexImportCache {
+    pub(crate) fn force_discovery(&mut self) {
+        self.last_discovery_at = None;
+    }
+
+    pub(crate) fn ui_snapshot(&self) -> Self {
+        Self {
+            latest_limits: self.latest_limits.clone(),
+            latest_session: self.latest_session.clone(),
+            diagnostics: self.diagnostics.clone(),
+            ..Self::default()
         }
     }
 }
@@ -206,6 +208,13 @@ impl CodexImportCache {
                 limits: None,
             },
         );
+        cache.latest_session = Some(CodexSessionSnapshot {
+            latest_input: input,
+            latest_output: output,
+            latest_cached: cached,
+            latest_context_window: window,
+            latest_timestamp: Some("2026-06-18T00:00:00Z".to_string()),
+        });
         cache
     }
 }
@@ -223,12 +232,18 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
     }
     let mut changes_detected = false;
     let mut discovery_ran = false;
+    let mut discovery_error = cache.diagnostics.discovery_error.clone();
     if should_refresh_file_discovery(cache) {
         discovery_ran = true;
-        let previous_count = cache.session_files.len();
-        cache.session_files = collect_codex_session_files(&sessions_dir).unwrap_or_default();
-        cache.last_discovery_at = Some(SystemTime::now());
-        changes_detected = changes_detected || cache.session_files.len() != previous_count;
+        match collect_codex_session_files(&sessions_dir) {
+            Ok(files) => {
+                changes_detected |= files != cache.session_files;
+                cache.session_files = files;
+                discovery_error = None;
+            }
+            Err(error) => discovery_error = Some(error.to_string()),
+        }
+        cache.last_discovery_at = Some(Instant::now());
     }
 
     // `session_files` is the authoritative active set; only refresh entries whose
@@ -280,12 +295,17 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
     }
 
     // Drop any cached session whose file is no longer discovered.
-    let active_paths: HashSet<&PathBuf> = files.iter().collect();
-    cache.sessions.retain(|path, _| active_paths.contains(path));
+    if discovery_ran {
+        let active_paths: HashSet<&PathBuf> = files.iter().collect();
+        cache.sessions.retain(|path, _| active_paths.contains(path));
+    }
     let active_count = files.len();
     cache.session_files = files;
-    cache.latest_limits = find_latest_limits(&cache.sessions);
-    if discovery_ran {
+    if changes_detected {
+        cache.latest_limits = find_latest_limits(&cache.sessions);
+        cache.latest_session = find_latest_session(&cache.sessions);
+    }
+    if changes_detected || discovery_ran {
         tune_discovery_interval(cache, changes_detected);
     }
     cache.diagnostics = CodexImportDiagnostics {
@@ -296,6 +316,7 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
         unreadable_files,
         last_import_at: Some(SystemTime::now()),
         discovery_interval: cache.session_discovery_interval,
+        discovery_error,
     };
 }
 
@@ -303,10 +324,7 @@ fn should_refresh_file_discovery(cache: &CodexImportCache) -> bool {
     let Some(last_discovery) = cache.last_discovery_at else {
         return true;
     };
-    match SystemTime::now().duration_since(last_discovery) {
-        Ok(elapsed) => elapsed >= cache.session_discovery_interval,
-        Err(_) => true,
-    }
+    last_discovery.elapsed() >= cache.session_discovery_interval
 }
 
 fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool) {
@@ -328,6 +346,7 @@ fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool)
 
 /// The most-recent session's token figures, used for the context-window gauge.
 /// Context is a per-conversation measure, so only the newest session matters.
+#[derive(Debug, Clone)]
 pub(crate) struct CodexSessionSnapshot {
     pub(crate) latest_input: u64,
     pub(crate) latest_output: u64,
@@ -338,21 +357,7 @@ pub(crate) struct CodexSessionSnapshot {
 }
 
 pub(crate) fn codex_session_snapshot(cache: &CodexImportCache) -> Option<CodexSessionSnapshot> {
-    // Single pass: pick the newest session carrying token usage.
-    let latest = cache
-        .sessions
-        .values()
-        .filter(|s| s.has_token_usage)
-        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))?;
-
-    Some(CodexSessionSnapshot {
-        latest_input: latest.input_tokens,
-        latest_output: latest.output_tokens,
-        latest_cached: latest.cached_input_tokens,
-        latest_context_window: latest.context_window,
-        #[cfg(test)]
-        latest_timestamp: Some(latest.timestamp.clone()),
-    })
+    cache.latest_session.clone()
 }
 
 #[cfg(test)]
@@ -374,29 +379,32 @@ fn codex_sessions_dir(config: &AppConfig) -> PathBuf {
         .join("sessions")
 }
 
-fn collect_codex_session_files(dir: &Path) -> Option<Vec<PathBuf>> {
-    if !dir.exists() {
-        return None;
-    }
-
+fn collect_codex_session_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    collect_jsonl_files_recursive(dir, &mut files).ok()?;
-    Some(files)
-}
-
-fn collect_jsonl_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files_recursive(&path, files)?;
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            files.push(path);
+    let mut directories = vec![dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if directory == dir => return Err(error),
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            // Do not follow symlinks: a linked ancestor can form an infinite cycle.
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            {
+                files.push(path);
+            }
         }
     }
-    Ok(())
+    files.sort_unstable();
+    Ok(files)
 }
 
 fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) -> ParsedSessionFile {
@@ -503,13 +511,13 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             .as_ref()
             .and_then(|payload| payload.rate_limits.as_ref())
             .and_then(|limits| limits.primary.as_ref())
-            .map(parse_codex_rate_limit);
+            .and_then(parse_codex_rate_limit);
         let secondary = parsed_line
             .payload
             .as_ref()
             .and_then(|payload| payload.rate_limits.as_ref())
             .and_then(|limits| limits.secondary.as_ref())
-            .map(parse_codex_rate_limit);
+            .and_then(parse_codex_rate_limit);
         if primary.is_some() || secondary.is_some() {
             let limit_timestamp = event_timestamp
                 .cloned()
@@ -565,11 +573,32 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
     })
 }
 
-fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> CodexRateLimit {
-    CodexRateLimit {
-        used_percent: node.used_percent.as_f64(),
-        resets_at: node.resets_at,
+fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> Option<CodexRateLimit> {
+    if !node.used_percent.is_finite() || node.used_percent < 0.0 {
+        return None;
     }
+    Some(CodexRateLimit {
+        used_percent: node.used_percent,
+        resets_at: node.resets_at,
+    })
+}
+
+fn find_latest_session(
+    sessions: &HashMap<PathBuf, CachedCodexSession>,
+) -> Option<CodexSessionSnapshot> {
+    let latest = sessions
+        .values()
+        .filter(|session| session.has_token_usage)
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))?;
+
+    Some(CodexSessionSnapshot {
+        latest_input: latest.input_tokens,
+        latest_output: latest.output_tokens,
+        latest_cached: latest.cached_input_tokens,
+        latest_context_window: latest.context_window,
+        #[cfg(test)]
+        latest_timestamp: Some(latest.timestamp.clone()),
+    })
 }
 
 fn find_latest_limits(sessions: &HashMap<PathBuf, CachedCodexSession>) -> Option<CodexRateLimits> {
@@ -623,6 +652,14 @@ mod tests {
         let parsed = parse_codex_session_contents(payload).expect("expected codex usage");
         let limits = parsed.limits.expect("expected limits");
         assert_eq!(limits.primary.expect("primary").used_percent, 7.0);
+    }
+
+    #[test]
+    fn ignores_negative_rate_limits() {
+        let payload = r#"{"timestamp":"2026-02-16T09:45:56.220Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":-1.0}}}}"#;
+        let parsed = parse_codex_session_contents_with_status(payload);
+
+        assert!(matches!(parsed, ParsedSessionContents::NoUsageOrLimits));
     }
 
     #[test]
@@ -801,7 +838,7 @@ mod tests {
         assert_eq!(cache.session_discovery_interval, MIN_DISCOVERY_INTERVAL);
 
         for _ in 0..3 {
-            cache.last_discovery_at = Some(SystemTime::now() - Duration::from_secs(3600));
+            cache.force_discovery();
             merge_codex_usage(&config, &mut cache);
         }
         assert_eq!(
@@ -813,7 +850,7 @@ mod tests {
         fs::create_dir_all(&session_dir).expect("create session dir");
         write_fixture(&session_dir, "mixed_usage_and_limits.jsonl");
 
-        cache.last_discovery_at = Some(SystemTime::now() - Duration::from_secs(3600));
+        cache.force_discovery();
         merge_codex_usage(&config, &mut cache);
         assert_eq!(cache.session_discovery_interval, MIN_DISCOVERY_INTERVAL);
 

@@ -52,11 +52,14 @@ fn parse_cli_args_from(args: impl IntoIterator<Item = String>) -> Result<CliActi
                 let seconds: f64 = value
                     .parse()
                     .map_err(|_| eyre!("invalid refresh interval: {value}"))?;
-                if seconds <= 0.0 {
+                if !seconds.is_finite() || seconds <= 0.0 {
                     bail!("--refresh-interval-seconds must be finite and > 0");
                 }
                 refresh_interval = Duration::try_from_secs_f64(seconds)
                     .map_err(|_| eyre!("--refresh-interval-seconds must be finite and > 0"))?;
+                if refresh_interval.is_zero() {
+                    bail!("--refresh-interval-seconds is too small");
+                }
             }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
@@ -116,7 +119,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_refresh_intervals_without_panicking() {
-        for value in ["NaN", "inf", "-inf", "0", "-1"] {
+        for value in ["NaN", "inf", "-inf", "0", "-1", "0.0000000001"] {
             let result = parse_cli_args_from(["--refresh-interval-seconds".into(), value.into()]);
             assert!(result.is_err(), "accepted {value}");
         }

@@ -1,15 +1,12 @@
-use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
 
 use crate::claude_import::{ClaudeImportDiagnostics, merge_claude_usage};
@@ -36,6 +33,8 @@ pub(crate) struct App {
     theme_override: Option<Theme>,
     refresh_rx: Option<Receiver<RefreshResult>>,
     reload_pending: bool,
+    force_discovery_pending: bool,
+    codex_source: Arc<Mutex<CodexImportCache>>,
 }
 
 struct RefreshResult {
@@ -58,28 +57,27 @@ impl App {
             theme_override: None,
             refresh_rx: None,
             reload_pending: false,
+            force_discovery_pending: false,
+            codex_source: Arc::new(Mutex::new(CodexImportCache::default())),
         };
-        app.reload_now();
+        app.request_refresh(false);
         Ok(app)
     }
 
-    /// Re-reads config from disk and refreshes both data sources. This is the
-    /// costly path (network + file scan); the render loop calls it sparingly.
-    fn reload_now(&mut self) {
-        self.reload_config();
-        merge_codex_usage(&self.config, &mut self.codex_cache);
-        merge_claude_usage(&self.config, &mut self.claude_cache);
+    pub(crate) fn request_reload(&mut self) {
+        self.request_refresh(true);
     }
 
-    pub(crate) fn request_reload(&mut self) {
+    fn request_refresh(&mut self, force_discovery: bool) {
         if self.refresh_rx.is_some() {
             self.reload_pending = true;
+            self.force_discovery_pending |= force_discovery;
             return;
         }
 
         let config_file = self.config_file.clone();
         let mut config = self.config.clone();
-        let mut codex_cache = self.codex_cache.clone();
+        let codex_source = Arc::clone(&self.codex_source);
         let mut claude_cache = self.claude_cache.clone();
         let (tx, rx) = mpsc::channel();
 
@@ -91,9 +89,18 @@ impl App {
                         config = reloaded;
                         None
                     }
-                    Err(error) => Some(error.to_string()),
+                    Err(error) => Some(format!("{error:#}")),
                 };
-                merge_codex_usage(&config, &mut codex_cache);
+                let codex_cache = {
+                    let mut source = codex_source
+                        .lock()
+                        .expect("Codex source worker mutex was poisoned");
+                    if force_discovery {
+                        source.force_discovery();
+                    }
+                    merge_codex_usage(&config, &mut source);
+                    source.ui_snapshot()
+                };
                 merge_claude_usage(&config, &mut claude_cache);
                 let _ = tx.send(RefreshResult {
                     config,
@@ -105,6 +112,7 @@ impl App {
             Ok(_) => {
                 self.refresh_rx = Some(rx);
                 self.reload_pending = false;
+                self.force_discovery_pending = false;
                 self.refresh_error = None;
             }
             Err(error) => {
@@ -134,7 +142,8 @@ impl App {
         }
 
         if self.reload_pending {
-            self.request_reload();
+            let force_discovery = self.force_discovery_pending;
+            self.request_refresh(force_discovery);
         }
     }
 
@@ -156,6 +165,7 @@ impl App {
         codex_cache: CodexImportCache,
         claude_cache: ClaudeImportDiagnostics,
     ) -> Self {
+        let codex_source = Arc::new(Mutex::new(codex_cache.clone()));
         Self {
             config,
             config_file: PathBuf::from("test-config.json"),
@@ -167,9 +177,12 @@ impl App {
             theme_override: None,
             refresh_rx: None,
             reload_pending: false,
+            force_discovery_pending: false,
+            codex_source,
         }
     }
 
+    #[cfg(test)]
     fn reload_config(&mut self) {
         match load_or_bootstrap_config(&self.config_file) {
             Ok(config) => {
@@ -195,6 +208,7 @@ pub(crate) fn run(
         // 2 Hz UI without touching the network or disk every frame.
         if event::poll(RENDER_INTERVAL)?
             && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
         {
             match key.code {
                 KeyCode::Char('q') => break,
@@ -209,7 +223,7 @@ pub(crate) fn run(
         }
 
         if last_refresh.elapsed() >= refresh_interval {
-            app.request_reload();
+            app.request_refresh(false);
             last_refresh = Instant::now();
         }
     }
@@ -217,21 +231,18 @@ pub(crate) fn run(
 }
 
 pub(crate) fn init_terminal() -> Result<DefaultTerminal> {
-    enable_raw_mode()?;
-    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
-        let _ = disable_raw_mode();
-        return Err(error.into());
+    match ratatui::try_init() {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            // Initialization can fail after raw mode or the alternate screen is set.
+            let _ = ratatui::try_restore();
+            Err(error.into())
+        }
     }
-    Ok(ratatui::init())
 }
 
 pub(crate) fn restore_terminal() -> Result<()> {
-    let raw_mode_result = disable_raw_mode();
-    let screen_result = execute!(io::stdout(), LeaveAlternateScreen);
-    ratatui::restore();
-    raw_mode_result?;
-    screen_result?;
-    Ok(())
+    Ok(ratatui::try_restore()?)
 }
 
 pub(crate) fn bootstrap_app(config_file: Option<PathBuf>) -> Result<App> {
@@ -270,6 +281,8 @@ mod tests {
             theme_override: None,
             refresh_rx: None,
             reload_pending: false,
+            force_discovery_pending: false,
+            codex_source: Arc::new(Mutex::new(CodexImportCache::default())),
         };
         app.reload_config();
         assert!(!app.config.codex_import.enabled);
@@ -301,6 +314,8 @@ mod tests {
             theme_override: None,
             refresh_rx: None,
             reload_pending: false,
+            force_discovery_pending: false,
+            codex_source: Arc::new(Mutex::new(CodexImportCache::default())),
         };
         app.config.codex_import.enabled = false;
         fs::write(&app.config_file, "not json").expect("write invalid config");

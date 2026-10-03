@@ -43,11 +43,14 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
   - `config: AppConfig` — loaded from `config.json`
   - `config_file: PathBuf` — authoritative config path across reloads
   - `config_error: Option<String>` — most recent config reload failure
-  - `codex_cache: CodexImportCache` — parsed Codex sessions + rate limits
+  - `codex_cache: CodexImportCache` — compact UI snapshot of Codex limits, context, and diagnostics
+  - `codex_source` — worker-owned mutable Codex session cache retained across refreshes
   - `claude_cache: ClaudeImportDiagnostics` — fetched Claude usage + limits
   - `show_help: bool` — help overlay toggle
 - **`App::request_reload()`** — starts a single background refresh. Additional requests are coalesced while work is in flight.
 - **`App::poll_reload()`** — atomically applies a completed config/data snapshot without blocking rendering.
+- **Codex source ownership** — the worker retains the mutable session cache and returns only a small precomputed view, so refresh requests do not clone historical sessions on the UI thread.
+- **Startup** — loads configuration synchronously, paints immediately, and acquires provider data in the background.
 - **`run()`** — main event loop:
   - Renders at 2 Hz (500ms tick) via `RENDER_INTERVAL`
   - Background data refresh defaults to 10s via `DEFAULT_REFRESH_INTERVAL` (configurable)
@@ -89,7 +92,9 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
 - **Streaming parser**: `BufRead`-based line-by-line parsing (not full-file `read_to_string`)
 - **Typed structs**: `CodexSessionLine`, `CodexSessionLinePayload`, `CodexTokenInfo`, etc.
 - **Caching**: tracks `mtime` + `file_len` per session file; only re-parses changed files
+- **Snapshot cache**: precomputes the newest token-bearing session so rendering does not scan the session map
 - **Discovery backoff**: scans every 10s initially; backs off to 120s after 3 idle cycles; resets to 10s when changes detected
+- **Filesystem safety**: sorts discovered paths and does not follow symlinked directories
 - **Diagnostics**: tracks `active_files`, `refreshed_files`, `parse_error_files`, `no_usage_or_limits_files`, `unreadable_files`
 - **Context window**: calculated from latest session as `input - cached_input + output` against `model_context_window`
 - **Rate limits**: extracted from `token_count` events with `rate_limits` payload; supports both `f64` and integer `used_percent` fields
@@ -102,7 +107,7 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
 - **API endpoint**: `GET https://api.anthropic.com/api/oauth/usage` with Bearer token
 - **Response**: `five_hour` and `seven_day` utilization percentages + reset timestamps
 - **Keychain detection**: runs `security find-generic-password -s "Claude Code-credentials" -w`, parses JSON for `claudeAiOauth.accessToken`, validates `sk-ant-oat` prefix
-- **Error handling**: surfaces auth failures (401/403) and network errors in the UI status line
+- **Error handling**: surfaces auth failures (401/403), network errors, and degraded-source state in the UI status line
 
 ## Data Flow
 

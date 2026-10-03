@@ -13,14 +13,16 @@ incremental. It should not introduce Tokio, a hosted backend, a plugin ABI, or a
 remote daemon yet.
 
 The renderer is already decoupled from refresh work and is not the primary
-scaling risk. Current scaling costs come from:
+scaling risk. The remaining scaling work comes from:
 
-1. Searching all cached sessions for the latest context during every render.
-2. Cloning the entire Codex cache on the UI thread for each refresh.
-3. Calling metadata on every known session during normal refreshes.
-4. Reparsing a growing JSONL file from byte zero.
-5. Coupling source schedules and rebuilding HTTP/credential resources.
-6. Displaying last-known values without a complete freshness contract.
+1. Calling metadata on every known session during normal refreshes.
+2. Reparsing a growing JSONL file from byte zero.
+3. Coupling source schedules and rebuilding HTTP/credential resources.
+4. Displaying last-known values without a complete freshness contract.
+
+The current runtime precomputes the latest context and limit views during ingest
+and keeps the mutable Codex source cache behind the refresh worker handle, so
+rendering and refresh requests no longer scan or clone historical sessions.
 
 ## Verified Baseline
 

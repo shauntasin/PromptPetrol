@@ -15,8 +15,10 @@ session's context scope.
 - Four palettes across full and compact display modes: Murphy, Paper, Arctic,
   and Solarized Light. The latter three are light themes.
 - A 2 Hz render loop separated from the configurable data-refresh interval.
+- Immediate first paint with data acquisition running in the background.
 - Incremental in-memory caching of unchanged Codex session files.
-- Recursive Codex session discovery with idle backoff from 10 to 120 seconds.
+- Deterministic, symlink-safe Codex session discovery with idle backoff from 10
+  to 120 seconds.
 - Config reload with `r` and an in-app keyboard reference with `?`.
 
 PromptPetrol currently displays subscription utilization and context usage. It
@@ -71,14 +73,10 @@ on Unix because it may contain an OAuth token.
 ```json
 {
   "theme": "murphy",
-  "codex_import": {
-    "enabled": true,
-    "sessions_dir": null
-  },
+  "codex_import": { "enabled": true },
   "claude_import": {
     "enabled": true
-  },
-  "claude_oauth_token": null
+  }
 }
 ```
 
@@ -88,8 +86,12 @@ on Unix because it may contain an OAuth token.
 - `codex_import.enabled`: enables local Codex session ingestion.
 - `codex_import.sessions_dir`: overrides the default `~/.codex/sessions` path.
 - `claude_import.enabled`: enables Claude credential discovery and API fetching.
-- `claude_oauth_token`: optional Claude OAuth token. Leaving it `null` enables
-  macOS Keychain discovery.
+- `claude_oauth_token`: optional Claude OAuth token. Omitting it or setting it to
+  `null` enables macOS Keychain discovery.
+
+The generated file omits optional fields until they are configured. A custom
+config file is also normalized to mode `0600` on Unix, and the default config
+directory is created with mode `0700`.
 
 Unknown config fields are ignored for compatibility with older config files. If
 a config reload fails, PromptPetrol keeps the last valid configuration and marks
@@ -133,6 +135,9 @@ old cache immediately.
 - `Auth failed (401/403)`: refresh the Claude OAuth credential.
 - `CONFIG ERROR` in the title: validate the selected JSON config file, then
   press `r`.
+- `SOURCE DEGRADED` or `DEGRADED` in the status line: inspect the source
+  diagnostics in the footer, then correct the reported Codex path or Claude
+  credential/network issue.
 - Broken layout: enlarge the terminal. Below 24 columns or 6 rows, PromptPetrol
   displays an enlargement prompt.
 
@@ -148,8 +153,8 @@ Run the same checks as CI:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
 ```
 
 Ignored tests are visual dumps and a local large-tree performance probe:

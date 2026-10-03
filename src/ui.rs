@@ -99,9 +99,9 @@ const fn palette_for(theme: Theme) -> Palette {
 /// One limit readout rendered as a boxed-digit odometer (drum + bar + reset).
 struct Metric {
     /// Full title for the spacious (tall) layout, e.g. "CLAUDE · 5h".
-    title: String,
+    title: &'static str,
     /// Short title for the compact layout, e.g. "CL 5h".
-    short: String,
+    short: &'static str,
     /// `None` means the value is unavailable; the drum shows `--`.
     percent: Option<f64>,
     note: String,
@@ -133,17 +133,18 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
-    let title = if app.config_error.is_some() {
-        format!(
-            " {APP_NAME} // CONFIG FAULT // {} ",
-            app.active_theme().label()
-        )
+    let status = if app.config_error.is_some() {
+        "CONFIG FAULT"
+    } else if app.refresh_error.is_some() {
+        "REFRESH FAULT"
+    } else if app.codex_cache.diagnostics.discovery_error.is_some()
+        || (app.config.claude_import.enabled && app.claude_cache.fetch_error.is_some())
+    {
+        "SOURCE DEGRADED"
     } else {
-        format!(
-            " {APP_NAME} // RESOURCE MFD // {} ",
-            app.active_theme().label()
-        )
+        "RESOURCE MFD"
     };
+    let title = format!(" {APP_NAME} // {status} // {} ", app.active_theme().label());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::PLAIN)
@@ -354,15 +355,14 @@ fn render_provider_bay(
         .title(Line::from(vec![
             Span::styled("◆ ", Style::default().fg(palette.decorative)),
             Span::styled(
-                provider.to_string(),
+                provider,
                 Style::default()
                     .fg(palette.text)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" // {source} "),
-                Style::default().fg(palette.accent),
-            ),
+            Span::styled(" // ", Style::default().fg(palette.accent)),
+            Span::styled(source, Style::default().fg(palette.accent)),
+            Span::styled(" ", Style::default().fg(palette.accent)),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -421,15 +421,14 @@ fn render_medium_provider_bay(
         .title(Line::from(vec![
             Span::styled("◆ ", Style::default().fg(palette.decorative)),
             Span::styled(
-                provider.to_string(),
+                provider,
                 Style::default()
                     .fg(palette.text)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" // {source} "),
-                Style::default().fg(palette.accent),
-            ),
+            Span::styled(" // ", Style::default().fg(palette.accent)),
+            Span::styled(source, Style::default().fg(palette.accent)),
+            Span::styled(" ", Style::default().fg(palette.accent)),
         ]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -760,9 +759,15 @@ fn render_rail(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
 
 fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Palette) {
     let diagnostics = &app.codex_cache.diagnostics;
-    let errors = diagnostics.parse_error_files + diagnostics.unreadable_files;
+    let errors = diagnostics.parse_error_files
+        + diagnostics.unreadable_files
+        + usize::from(diagnostics.discovery_error.is_some());
     let system_state = if app.config_error.is_some() || app.refresh_error.is_some() {
         "FAULT"
+    } else if errors > 0
+        || (app.config.claude_import.enabled && app.claude_cache.fetch_error.is_some())
+    {
+        "DEGRADED"
     } else if app.is_refreshing() {
         "ACQUIRING"
     } else {
@@ -770,7 +775,7 @@ fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
     };
     let state_color = if system_state == "FAULT" {
         palette.critical
-    } else if system_state == "ACQUIRING" {
+    } else if matches!(system_state, "ACQUIRING" | "DEGRADED") {
         palette.warning
     } else {
         palette.normal
@@ -784,11 +789,17 @@ fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
     frame.render_widget(block, area);
 
     let status = format!(
-        "SYS {system_state}  |  CX FILES {:03}  REF {:03}  ERR {:02}  SCAN {:03}S",
+        "SYS {system_state} | CX FILES {:03} REF {:03} ERR {:02} SKIP {:03} SCAN {:03}S AGE {}",
         diagnostics.active_files,
         diagnostics.refreshed_files,
         errors,
-        diagnostics.discovery_interval.as_secs()
+        diagnostics.no_usage_or_limits_files,
+        diagnostics.discovery_interval.as_secs(),
+        diagnostics
+            .last_import_at
+            .and_then(|time| time.elapsed().ok())
+            .map(|age| format!("{}S", age.as_secs()))
+            .unwrap_or_else(|| "--".into())
     );
     frame.render_widget(
         Paragraph::new(vec![
@@ -901,12 +912,12 @@ fn fit_status_line(left: &str, right: &str, width: usize) -> (String, String, St
 fn collect_metrics(
     claude: &ClaudeImportDiagnostics,
     codex: &CodexImportCache,
-) -> (Vec<Metric>, Vec<Metric>) {
+) -> ([Metric; 2], [Metric; 2]) {
     let cl = claude.limits.as_ref();
-    let claude_metrics = vec![
+    let claude_metrics = [
         Metric {
-            title: "CLAUDE · 5h".into(),
-            short: "CL 5h".into(),
+            title: "CLAUDE · 5h",
+            short: "CL 5h",
             percent: cl.and_then(|l| l.primary.as_ref()).map(|l| l.used_percent),
             note: reset_note(
                 cl.and_then(|l| l.primary.as_ref())
@@ -915,8 +926,8 @@ fn collect_metrics(
             ),
         },
         Metric {
-            title: "CLAUDE · weekly".into(),
-            short: "CL wk".into(),
+            title: "CLAUDE · weekly",
+            short: "CL wk",
             percent: cl
                 .and_then(|l| l.secondary.as_ref())
                 .map(|l| l.used_percent),
@@ -929,10 +940,10 @@ fn collect_metrics(
     ];
 
     let cx = codex.latest_limits.as_ref();
-    let codex_metrics = vec![
+    let codex_metrics = [
         Metric {
-            title: "CODEX · 5h".into(),
-            short: "CX 5h".into(),
+            title: "CODEX · 5h",
+            short: "CX 5h",
             percent: cx.and_then(|l| l.primary.as_ref()).map(|l| l.used_percent),
             note: reset_note(
                 cx.and_then(|l| l.primary.as_ref())
@@ -941,8 +952,8 @@ fn collect_metrics(
             ),
         },
         Metric {
-            title: "CODEX · weekly".into(),
-            short: "CX wk".into(),
+            title: "CODEX · weekly",
+            short: "CX wk",
             percent: cx
                 .and_then(|l| l.secondary.as_ref())
                 .map(|l| l.used_percent),
@@ -959,7 +970,10 @@ fn collect_metrics(
 
 fn collect_context(codex: &CodexImportCache) -> Option<Context> {
     let snap = codex_session_snapshot(codex)?;
-    let tokens = snap.latest_input.saturating_sub(snap.latest_cached) + snap.latest_output;
+    let tokens = snap
+        .latest_input
+        .saturating_sub(snap.latest_cached)
+        .saturating_add(snap.latest_output);
     let window = snap.latest_context_window;
     if window == 0 {
         return None;
@@ -1115,7 +1129,7 @@ fn render_tall_metric(frame: &mut Frame<'_>, area: Rect, metric: &Metric, palett
 
     let bar_w = rw.saturating_sub(1) as usize;
     let mut lines = vec![Line::styled(
-        truncate(&metric.title, rw as usize),
+        truncate(metric.title, rw as usize),
         Style::default()
             .fg(palette.text)
             .add_modifier(Modifier::BOLD),
@@ -1142,7 +1156,7 @@ fn render_compact_metric(frame: &mut Frame<'_>, area: Rect, metric: &Metric, pal
         Some(p) => format!("{:>3.0}%", p.min(999.0)),
         None => "  --".into(),
     };
-    let title = truncate(&metric.short, 6);
+    let title = truncate(metric.short, 6);
     let title_pad = format!("{title:<6}");
 
     let avail = area.width as usize;
@@ -1387,12 +1401,10 @@ mod tests {
     }
 
     fn sample_app() -> App {
-        let mut claude_cache = ClaudeImportDiagnostics {
-            five_hour_pct: 48.0,
-            seven_day_pct: 8.0,
-            limits: Some(limits(48.0, 8.0)),
-            ..Default::default()
-        };
+        let mut claude_cache = ClaudeImportDiagnostics::default();
+        claude_cache.five_hour_pct = 48.0;
+        claude_cache.seven_day_pct = 8.0;
+        claude_cache.limits = Some(limits(48.0, 8.0));
         claude_cache.fetch_error = None;
 
         // input - cached + output = 65016, window 258400 -> ~25%.

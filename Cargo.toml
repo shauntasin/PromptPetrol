@@ -2,13 +2,21 @@
 name = "promptpetrol"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A local terminal dashboard for Claude and Codex usage"
+repository = "https://github.com/shauntasin/PromptPetrol"
+readme = "README.md"
 
 [dependencies]
+chrono = "0.4"
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 dirs = "6.0.0"
 ratatui = "0.30.2"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls-native-roots",
+] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-chrono = "0.4"

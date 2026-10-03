@@ -8,19 +8,19 @@ Created automatically on first run. Unknown fields are ignored for backward comp
 
 ```json
 {
+  "theme": "murphy",
   "codex_import": {
-    "enabled": true,
-    "sessions_dir": null
+    "enabled": true
   },
   "claude_import": {
     "enabled": true
-  },
-  "claude_oauth_token": null
+  }
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `theme` | `string` | `murphy` | Color theme: `murphy`, `paper`, `arctic`, or `solarized-light` |
 | `codex_import.enabled` | `bool` | `true` | Enable/disable Codex session import |
 | `codex_import.sessions_dir` | `string \| null` | `null` | Custom path to Codex sessions directory (default: `~/.codex/sessions`) |
 | `claude_import.enabled` | `bool` | `true` | Enable/disable Keychain discovery and Claude API fetching |
@@ -137,7 +137,7 @@ Each file is a JSONL (one JSON object per line) representing a Codex session.
 2. **Token usage**: accumulated from `token_count` events with `info.total_token_usage`
 3. **Context window**: read from `info.model_context_window` (last seen wins)
 4. **Rate limits**: last `rate_limits` payload in the file wins
-5. **`used_percent`**: accepts both `f64` and `u64` (integer) — normalized to `f64`
+5. **`used_percent`**: accepts JSON numbers and normalizes them to `f64`; negative or non-finite values are ignored
 6. **`info: null`**: rate limits can still be present even when `info` is null
 7. **Malformed lines**: silently skipped; a file is classified as a parse error only when it contains no valid JSON lines
 
