@@ -93,11 +93,15 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
 - **File discovery**: recursively scans `~/.codex/sessions` (or custom path) for `.jsonl` files
 - **Streaming parser**: `BufRead`-based line-by-line parsing (not full-file `read_to_string`)
 - **Typed structs**: `CodexSessionLine`, `CodexSessionLinePayload`, `CodexTokenInfo`, etc.
-- **Caching**: tracks `mtime` + `file_len` per session file; only re-parses changed files
+- **Caching**: tracks `mtime`, `file_len`, and file identity per session file;
+  only re-parses changed files
+- **Incremental ingest**: tracks a committed newline offset, file identity, and
+  prefix/boundary fingerprints; append refreshes parse only new records and
+  incomplete trailing records are retried rather than accepted
 - **Snapshot cache**: precomputes the newest token-bearing session so rendering does not scan the session map
 - **Discovery backoff**: scans every 10s initially; backs off to 120s after 3 idle cycles; resets to 10s when changes detected
 - **Filesystem safety**: sorts discovered paths and does not follow symlinked directories
-- **Diagnostics**: tracks `active_files`, `refreshed_files`, `parse_error_files`, `no_usage_or_limits_files`, `unreadable_files`
+- **Diagnostics**: tracks `active_files`, `refreshed_files`, `parse_error_files`, `no_usage_or_limits_files`, `unreadable_files`, plus source attempt/success age, duration, and consecutive failures
 - **Context window**: calculated from latest session as `input - cached_input + output` against `model_context_window`
 - **Rate limits**: extracted from `token_count` events with `rate_limits` payload; supports both `f64` and integer `used_percent` fields
 
@@ -108,7 +112,7 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
   2. Auto-detected from macOS Keychain (`Claude Code-credentials` entry)
 - **API endpoint**: `GET https://api.anthropic.com/api/oauth/usage` with Bearer token
 - **Response**: `five_hour` and `seven_day` utilization percentages + reset timestamps
-- **Keychain detection**: runs `security find-generic-password -s "Claude Code-credentials" -w`, parses JSON for `claudeAiOauth.accessToken`, validates `sk-ant-oat` prefix
+- **Keychain detection**: runs `security find-generic-password -s "Claude Code-credentials" -w`, parses JSON for `claudeAiOauth.accessToken`, validates `sk-ant-oat` prefix, and caches the result for 30 seconds
 - **Error handling**: surfaces auth failures (401/403), network errors, and degraded-source state in the UI status line
 
 ## Data Flow
@@ -118,10 +122,10 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
    ├─ re-read config.json (if changed)
    ├─ merge_codex_usage()
    │   ├─ discover .jsonl files (with backoff)
-   │   ├─ parse changed files (streaming BufRead)
+   │   ├─ parse changed files (streaming BufRead; append from committed cursor)
    │   ├─ update session cache
    │   ├─ find latest rate limits
-   │   └─ update diagnostics
+   │   └─ update diagnostics and source freshness
    └─ merge_claude_usage()
        ├─ resolve OAuth token (config → keychain)
        ├─ fetch /api/oauth/usage
@@ -144,6 +148,7 @@ PromptPetrol is a Rust TUI application that monitors Claude and Codex subscripti
 | Render loop | 500ms (2 Hz) | UI redraw from cached state |
 | Data refresh | 10s (configurable) | Network fetch + filesystem scan |
 | Discovery scan | 10s–120s (adaptive) | File discovery in `~/.codex/sessions` |
+| Keychain lookup | 30s cache | Avoid repeated `security` subprocess calls |
 
 The render and data loops are decoupled. Filesystem and network work runs on a
 single-flight background thread, so a slow request does not stall input or paint

@@ -18,8 +18,13 @@ session's context scope.
 - A 2 Hz render loop separated from the configurable data-refresh interval.
 - Immediate first paint with data acquisition running in the background.
 - Incremental in-memory caching of unchanged Codex session files.
+- Append-aware Codex ingestion that parses only newly committed JSONL records,
+  retries partial trailing records, and rebuilds safely after replacement or
+  truncation.
 - Deterministic, symlink-safe Codex session discovery with idle backoff from 10
   to 120 seconds.
+- Source freshness, attempt duration, and degraded-state diagnostics in the
+  dashboard footer.
 - Config reload with `r` and an in-app keyboard reference with `?`.
 
 PromptPetrol currently displays subscription utilization and context usage. It
@@ -124,8 +129,11 @@ input_tokens - cached_input_tokens + output_tokens
 
 Only files whose modification time or length changed are reparsed. File
 discovery starts at a 10-second cadence and gradually backs off to 120 seconds
-after idle cycles; changing the configured sessions directory invalidates the
-old cache immediately.
+after idle cycles. Appends are parsed from the last committed newline; a
+partial trailing record is retained until the next refresh. File identity plus
+small prefix and cursor-boundary fingerprints detect replacement or truncation
+and trigger a safe full rebuild before an append is trusted. Changing the
+configured sessions directory invalidates the old cache immediately.
 
 ## Troubleshooting
 

@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use color_eyre::eyre::{Result, eyre};
 use reqwest::blocking::Client;
@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::codex_import::{CodexRateLimit, CodexRateLimits};
 use crate::models::AppConfig;
+
+const KEYCHAIN_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClaudeOAuthUsage {
@@ -24,7 +26,14 @@ pub(crate) struct ClaudeUsageWindow {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeImportDiagnostics {
     client: Option<Client>,
+    resolved_token: Option<String>,
+    configured_token: Option<String>,
+    token_lookup_at: Option<Instant>,
     pub(crate) last_fetch_at: Option<SystemTime>,
+    pub(crate) last_attempt_at: Option<SystemTime>,
+    pub(crate) last_success_at: Option<SystemTime>,
+    pub(crate) last_duration: Option<Duration>,
+    pub(crate) consecutive_failures: u32,
     pub(crate) fetch_error: Option<String>,
     pub(crate) five_hour_pct: f64,
     pub(crate) seven_day_pct: f64,
@@ -82,16 +91,29 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
         return;
     }
 
-    let token = config
+    let started = Instant::now();
+    diagnostics.last_attempt_at = Some(SystemTime::now());
+    let configured_token = config
         .claude_oauth_token
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(str::to_owned)
-        .or_else(detect_claude_token);
+        .map(str::to_owned);
+
+    if diagnostics.configured_token != configured_token {
+        diagnostics.configured_token = configured_token.clone();
+        diagnostics.resolved_token = None;
+        diagnostics.token_lookup_at = None;
+    }
+
+    let token = configured_token.or_else(|| resolve_keychain_token(diagnostics));
 
     let Some(oauth_token) = token else {
-        diagnostics.fetch_error = Some("No OAuth token (set claude_oauth_token in config)".into());
+        record_failure(
+            diagnostics,
+            started,
+            "No OAuth token (set claude_oauth_token in config)",
+        );
         return;
     };
 
@@ -110,7 +132,7 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
                 client
             }
             Err(error) => {
-                diagnostics.fetch_error = Some(format!("Client error: {error}"));
+                record_failure(diagnostics, started, &format!("Client error: {error}"));
                 return;
             }
         },
@@ -123,6 +145,9 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
     ) {
         Ok(Some(usage)) => {
             diagnostics.last_fetch_at = Some(SystemTime::now());
+            diagnostics.last_success_at = diagnostics.last_fetch_at;
+            diagnostics.last_duration = Some(started.elapsed());
+            diagnostics.consecutive_failures = 0;
             diagnostics.fetch_error = None;
             diagnostics.five_hour_pct = usage.five_hour.utilization;
             diagnostics.seven_day_pct = usage.seven_day.utilization;
@@ -133,12 +158,33 @@ pub(crate) fn merge_claude_usage(config: &AppConfig, diagnostics: &mut ClaudeImp
             });
         }
         Ok(None) => {
-            diagnostics.fetch_error = Some("Auth failed (401/403)".into());
+            diagnostics.resolved_token = None;
+            diagnostics.token_lookup_at = Some(Instant::now());
+            record_failure(diagnostics, started, "Auth failed (401/403)");
         }
         Err(e) => {
-            diagnostics.fetch_error = Some(format!("Fetch error: {e}"));
+            record_failure(diagnostics, started, &format!("Fetch error: {e}"));
         }
     }
+}
+
+fn resolve_keychain_token(diagnostics: &mut ClaudeImportDiagnostics) -> Option<String> {
+    if diagnostics
+        .token_lookup_at
+        .is_some_and(|last| last.elapsed() < KEYCHAIN_LOOKUP_INTERVAL)
+    {
+        return diagnostics.resolved_token.clone();
+    }
+
+    diagnostics.token_lookup_at = Some(Instant::now());
+    diagnostics.resolved_token = detect_claude_token();
+    diagnostics.resolved_token.clone()
+}
+
+fn record_failure(diagnostics: &mut ClaudeImportDiagnostics, started: Instant, error: &str) {
+    diagnostics.fetch_error = Some(error.to_owned());
+    diagnostics.last_duration = Some(started.elapsed());
+    diagnostics.consecutive_failures = diagnostics.consecutive_failures.saturating_add(1);
 }
 
 #[cfg(target_os = "macos")]

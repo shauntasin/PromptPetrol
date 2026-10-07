@@ -56,10 +56,10 @@ queues or overlapping requests.
 
 ## S3 - Incremental Codex Ingest
 
-- [ ] S3.1 Split parser state from file I/O so the same state machine handles full and appended input
-- [ ] S3.2 Store last committed byte offset and retain an incomplete trailing line without advancing the cursor
-- [ ] S3.3 Parse only bytes appended after the committed offset
-- [ ] S3.4 Detect truncation, replacement, incompatible file identity, and source-directory changes and rebuild affected state
+- [x] S3.1 Split parser state from file I/O so the same state machine handles full and appended input
+- [x] S3.2 Store last committed byte offset and retain an incomplete trailing line without advancing the cursor
+- [x] S3.3 Parse only bytes appended after the committed offset
+- [x] S3.4 Detect truncation, replacement, incompatible file identity, and source-directory changes and rebuild affected state
 - [ ] S3.5 Add stable deduplication for replayed events and idempotence tests across repeated refreshes
 - [ ] S3.6 Introduce `notify` as a change accelerator with event coalescing
 - [ ] S3.7 Trigger full reconciliation when `notify::Event::need_rescan()` is true

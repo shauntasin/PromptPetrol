@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -207,6 +207,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     } else if app.refresh_error.is_some() {
         "REFRESH FAULT"
     } else if app.codex_cache.diagnostics.discovery_error.is_some()
+        || app.codex_cache.diagnostics.parse_error_files > 0
+        || app.codex_cache.diagnostics.unreadable_files > 0
         || (app.config.claude_import.enabled && app.claude_cache.fetch_error.is_some())
     {
         "SOURCE DEGRADED"
@@ -881,17 +883,19 @@ fn render_mfd_footer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
     frame.render_widget(block, area);
 
     let status = format!(
-        "SYS {system_state} | CX FILES {:03} REF {:03} ERR {:02} SKIP {:03} SCAN {:03}S AGE {}",
+        "SYS {system_state} | CX FILES {:03} REF {:03} ERR {:02} SKIP {:03} SCAN {:03}S CXAGE {} {}MS CLAGE {} {}MS",
         diagnostics.active_files,
         diagnostics.refreshed_files,
         errors,
         diagnostics.no_usage_or_limits_files,
         diagnostics.discovery_interval.as_secs(),
-        diagnostics
-            .last_import_at
-            .and_then(|time| time.elapsed().ok())
-            .map(|age| format!("{}S", age.as_secs()))
-            .unwrap_or_else(|| "--".into())
+        source_age(diagnostics.last_success_at, diagnostics.last_attempt_at),
+        duration_millis(diagnostics.last_duration),
+        source_age(
+            app.claude_cache.last_success_at,
+            app.claude_cache.last_attempt_at,
+        ),
+        duration_millis(app.claude_cache.last_duration),
     );
     frame.render_widget(
         Paragraph::new(vec![
@@ -1377,6 +1381,20 @@ fn percent_color(pct: f64, palette: Palette) -> Color {
     } else {
         palette.normal
     }
+}
+
+fn source_age(success: Option<SystemTime>, attempt: Option<SystemTime>) -> String {
+    success
+        .or(attempt)
+        .and_then(|time| time.elapsed().ok())
+        .map(|age| format!("{}S", age.as_secs()))
+        .unwrap_or_else(|| "--".into())
+}
+
+fn duration_millis(duration: Option<Duration>) -> String {
+    duration
+        .map(|duration| duration.as_millis().min(99_999).to_string())
+        .unwrap_or_else(|| "--".into())
 }
 
 fn format_reset(resets_at: Option<u64>) -> String {

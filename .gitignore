@@ -27,3 +27,4 @@ tmp/
 # Codex / agent-related local artifacts
 .codex/
 AGENTS.md
+.promptpetrol-context.md

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -12,11 +12,18 @@ use crate::models::AppConfig;
 const MIN_DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
 const DISCOVERY_BACKOFF_STEP: Duration = Duration::from_secs(10);
+const PREFIX_FINGERPRINT_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct CachedCodexSession {
     modified: SystemTime,
     file_len: u64,
+    parsed_len: u64,
+    file_identity: Option<FileIdentity>,
+    prefix_fingerprint: u64,
+    boundary_fingerprint: u64,
+    session_timestamp: Option<String>,
+    latest_event_timestamp: Option<String>,
     timestamp: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -26,6 +33,14 @@ struct CachedCodexSession {
     limits: Option<CodexRateLimits>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CodexImportDiagnostics {
     pub(crate) active_files: usize,
@@ -33,7 +48,10 @@ pub(crate) struct CodexImportDiagnostics {
     pub(crate) parse_error_files: usize,
     pub(crate) no_usage_or_limits_files: usize,
     pub(crate) unreadable_files: usize,
-    pub(crate) last_import_at: Option<SystemTime>,
+    pub(crate) last_attempt_at: Option<SystemTime>,
+    pub(crate) last_success_at: Option<SystemTime>,
+    pub(crate) last_duration: Option<Duration>,
+    pub(crate) consecutive_failures: u32,
     pub(crate) discovery_interval: Duration,
     pub(crate) discovery_error: Option<String>,
 }
@@ -46,7 +64,10 @@ impl Default for CodexImportDiagnostics {
             parse_error_files: 0,
             no_usage_or_limits_files: 0,
             unreadable_files: 0,
-            last_import_at: None,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_duration: None,
+            consecutive_failures: 0,
             discovery_interval: MIN_DISCOVERY_INTERVAL,
             discovery_error: None,
         }
@@ -54,7 +75,7 @@ impl Default for CodexImportDiagnostics {
 }
 
 enum ParsedSessionFile {
-    Parsed(CachedCodexSession),
+    Parsed(Box<CachedCodexSession>),
     NoUsageOrLimits,
     ParseError,
     Unreadable,
@@ -67,6 +88,9 @@ enum ParsedSessionContents {
 }
 
 struct CodexSessionData {
+    parsed_len: u64,
+    session_timestamp: Option<String>,
+    latest_event_timestamp: Option<String>,
     timestamp: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -199,6 +223,12 @@ impl CodexImportCache {
             CachedCodexSession {
                 modified: SystemTime::now(),
                 file_len: 0,
+                parsed_len: 0,
+                file_identity: None,
+                prefix_fingerprint: 0,
+                boundary_fingerprint: 0,
+                session_timestamp: Some("2026-06-18T00:00:00Z".to_string()),
+                latest_event_timestamp: None,
                 timestamp: "2026-06-18T00:00:00Z".to_string(),
                 input_tokens: input,
                 output_tokens: output,
@@ -225,11 +255,15 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
         return;
     }
 
+    let started = Instant::now();
+    let attempt_at = SystemTime::now();
     let sessions_dir = codex_sessions_dir(config);
     if cache.source_dir.as_ref() != Some(&sessions_dir) {
         *cache = CodexImportCache::default();
         cache.source_dir = Some(sessions_dir.clone());
     }
+    let previous_success_at = cache.diagnostics.last_success_at;
+    let previous_failures = cache.diagnostics.consecutive_failures;
     let mut changes_detected = false;
     let mut discovery_ran = false;
     let mut discovery_error = cache.diagnostics.discovery_error.clone();
@@ -254,30 +288,47 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
     let mut unreadable_files = 0_usize;
     let files = std::mem::take(&mut cache.session_files);
     for file in &files {
-        let (modified, file_len) =
-            match fs::metadata(file).and_then(|m| Ok((m.modified()?, m.len()))) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    changes_detected = true;
-                    unreadable_files += 1;
-                    cache.sessions.remove(file);
-                    continue;
-                }
-            };
+        let metadata = match fs::metadata(file) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                changes_detected = true;
+                unreadable_files += 1;
+                cache.sessions.remove(file);
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(_) => {
+                changes_detected = true;
+                unreadable_files += 1;
+                cache.sessions.remove(file);
+                continue;
+            }
+        };
+        let file_len = metadata.len();
+        let file_identity = file_identity(&metadata);
 
-        let needs_refresh = cache
-            .sessions
-            .get(file)
-            .is_none_or(|cached| cached.modified != modified || cached.file_len != file_len);
+        let needs_refresh = cache.sessions.get(file).is_none_or(|cached| {
+            cached.modified != modified
+                || cached.file_len != file_len
+                || cached.file_identity != file_identity
+        });
         if !needs_refresh {
             continue;
         }
         changes_detected = true;
         refreshed_files += 1;
 
-        match parse_codex_session_file(file, modified, file_len) {
+        match parse_codex_session_file(
+            file,
+            modified,
+            file_len,
+            file_identity,
+            cache.sessions.get(file),
+        ) {
             ParsedSessionFile::Parsed(parsed) => {
-                cache.sessions.insert(file.clone(), parsed);
+                cache.sessions.insert(file.clone(), *parsed);
             }
             ParsedSessionFile::NoUsageOrLimits => {
                 no_usage_or_limits_files += 1;
@@ -314,7 +365,18 @@ pub(crate) fn merge_codex_usage(config: &AppConfig, cache: &mut CodexImportCache
         parse_error_files,
         no_usage_or_limits_files,
         unreadable_files,
-        last_import_at: Some(SystemTime::now()),
+        last_attempt_at: Some(attempt_at),
+        last_success_at: if discovery_error.is_none() {
+            Some(attempt_at)
+        } else {
+            previous_success_at
+        },
+        last_duration: Some(started.elapsed()),
+        consecutive_failures: if discovery_error.is_none() {
+            0
+        } else {
+            previous_failures.saturating_add(1)
+        },
         discovery_interval: cache.session_discovery_interval,
         discovery_error,
     };
@@ -407,28 +469,112 @@ fn collect_codex_session_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn parse_codex_session_file(path: &Path, modified: SystemTime, file_len: u64) -> ParsedSessionFile {
+fn file_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn parse_codex_session_file(
+    path: &Path,
+    modified: SystemTime,
+    file_len: u64,
+    file_identity: Option<FileIdentity>,
+    cached: Option<&CachedCodexSession>,
+) -> ParsedSessionFile {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return ParsedSessionFile::Unreadable,
     };
-    let reader = BufReader::new(file);
+    let prefix_fingerprint = file_prefix_fingerprint(path).unwrap_or_default();
 
-    match parse_codex_session_reader(reader) {
-        ParsedSessionContents::Parsed(data) => ParsedSessionFile::Parsed(CachedCodexSession {
-            modified,
-            file_len,
-            timestamp: data.timestamp,
-            input_tokens: data.input_tokens,
-            output_tokens: data.output_tokens,
-            cached_input_tokens: data.cached_input_tokens,
-            context_window: data.context_window,
-            has_token_usage: data.has_token_usage,
-            limits: data.limits,
-        }),
-        ParsedSessionContents::NoUsageOrLimits => ParsedSessionFile::NoUsageOrLimits,
-        ParsedSessionContents::ParseError => ParsedSessionFile::ParseError,
+    let append = cached.is_some_and(|cached| {
+        file_len > cached.file_len
+            && cached.parsed_len <= file_len
+            && cached.file_identity == file_identity
+            && cached.prefix_fingerprint == prefix_fingerprint
+            && cached.boundary_fingerprint
+                == file_boundary_fingerprint(path, cached.parsed_len).unwrap_or_default()
+    });
+    let mut file = file;
+    let mut parser = cached
+        .filter(|_| append)
+        .map(CodexSessionParser::from_cached)
+        .unwrap_or_default();
+    let start_offset = if append {
+        cached.map_or(0, |cached| cached.parsed_len)
+    } else {
+        0
+    };
+    if start_offset > 0 && file.seek(SeekFrom::Start(start_offset)).is_err() {
+        return ParsedSessionFile::Unreadable;
     }
+
+    match parser.parse_reader(BufReader::new(file), start_offset, false) {
+        Ok(_) => match parser.finish() {
+            ParsedSessionContents::Parsed(data) => {
+                let parsed_len = data.parsed_len;
+                let boundary_fingerprint =
+                    file_boundary_fingerprint(path, parsed_len).unwrap_or_default();
+                ParsedSessionFile::Parsed(Box::new(CachedCodexSession {
+                    modified,
+                    file_len,
+                    parsed_len,
+                    file_identity,
+                    prefix_fingerprint,
+                    boundary_fingerprint,
+                    session_timestamp: data.session_timestamp,
+                    latest_event_timestamp: data.latest_event_timestamp,
+                    timestamp: data.timestamp,
+                    input_tokens: data.input_tokens,
+                    output_tokens: data.output_tokens,
+                    cached_input_tokens: data.cached_input_tokens,
+                    context_window: data.context_window,
+                    has_token_usage: data.has_token_usage,
+                    limits: data.limits,
+                }))
+            }
+            ParsedSessionContents::NoUsageOrLimits => ParsedSessionFile::NoUsageOrLimits,
+            ParsedSessionContents::ParseError => ParsedSessionFile::ParseError,
+        },
+        Err(_) => ParsedSessionFile::Unreadable,
+    }
+}
+
+fn file_prefix_fingerprint(path: &Path) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    let mut prefix = [0_u8; PREFIX_FINGERPRINT_BYTES];
+    let bytes_read = file.read(&mut prefix)?;
+    Ok(fingerprint(&prefix[..bytes_read]))
+}
+
+fn file_boundary_fingerprint(path: &Path, committed_len: u64) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    let start = committed_len.saturating_sub(PREFIX_FINGERPRINT_BYTES as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut boundary = [0_u8; PREFIX_FINGERPRINT_BYTES];
+    let bytes_read = file.read(&mut boundary)?;
+    Ok(fingerprint(&boundary[..bytes_read]))
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211_u64);
+    }
+    hash ^ bytes.len() as u64
 }
 
 #[cfg(test)]
@@ -444,37 +590,75 @@ fn parse_codex_session_contents_with_status(contents: &str) -> ParsedSessionCont
     parse_codex_session_reader(std::io::Cursor::new(contents.as_bytes()))
 }
 
-fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContents {
-    let mut parsed_json_lines = 0_usize;
-    let mut session_timestamp: Option<String> = None;
-    let mut latest_event_timestamp: Option<String> = None;
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut cached_input_tokens: u64 = 0;
-    let mut context_window: u64 = 0;
-    let mut has_token_usage = false;
-    let mut latest_limits: Option<CodexRateLimits> = None;
-    let mut line = String::new();
+#[derive(Default)]
+struct CodexSessionParser {
+    parsed_json_lines: usize,
+    parsed_len: u64,
+    session_timestamp: Option<String>,
+    latest_event_timestamp: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    context_window: u64,
+    has_token_usage: bool,
+    latest_limits: Option<CodexRateLimits>,
+}
 
-    loop {
-        line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
-            Ok(count) => count,
-            Err(_) => return ParsedSessionContents::ParseError,
-        };
-        if bytes_read == 0 {
-            break;
+impl CodexSessionParser {
+    fn from_cached(cached: &CachedCodexSession) -> Self {
+        Self {
+            parsed_json_lines: 1,
+            parsed_len: cached.parsed_len,
+            session_timestamp: cached.session_timestamp.clone(),
+            latest_event_timestamp: cached.latest_event_timestamp.clone(),
+            input_tokens: cached.input_tokens,
+            output_tokens: cached.output_tokens,
+            cached_input_tokens: cached.cached_input_tokens,
+            context_window: cached.context_window,
+            has_token_usage: cached.has_token_usage,
+            latest_limits: cached.limits.clone(),
+        }
+    }
+
+    fn parse_reader<R: BufRead>(
+        &mut self,
+        mut reader: R,
+        start_offset: u64,
+        allow_partial_line: bool,
+    ) -> io::Result<u64> {
+        let mut committed_len = start_offset;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let complete = line.ends_with('\n');
+            if complete || allow_partial_line {
+                committed_len += bytes_read as u64;
+                self.accept_line(line.trim_end_matches(['\n', '\r']));
+            }
+            if !complete {
+                break;
+            }
         }
 
-        let line = line.trim_end_matches(['\n', '\r']);
+        self.parsed_len = committed_len;
+        Ok(committed_len)
+    }
+
+    fn accept_line(&mut self, line: &str) {
         if line.is_empty() {
-            continue;
+            return;
         }
 
         let Ok(parsed_line) = serde_json::from_str::<CodexSessionLine>(line) else {
-            continue;
+            return;
         };
-        parsed_json_lines += 1;
+        self.parsed_json_lines += 1;
 
         if parsed_line.event_type == "session_meta" {
             let meta_timestamp = parsed_line
@@ -483,9 +667,9 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
                 .and_then(|payload| payload.timestamp.as_ref())
                 .or(parsed_line.timestamp.as_ref());
             if let Some(ts) = meta_timestamp {
-                session_timestamp = Some(ts.clone());
+                self.session_timestamp = Some(ts.clone());
             }
-            continue;
+            return;
         }
 
         let is_token_count = parsed_line.event_type == "event_msg"
@@ -495,7 +679,7 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
                 .and_then(|payload| payload.payload_type.as_deref())
                 == Some("token_count");
         if !is_token_count {
-            continue;
+            return;
         }
 
         let event_timestamp = parsed_line.timestamp.as_ref().or(parsed_line
@@ -503,7 +687,7 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
             .as_ref()
             .and_then(|payload| payload.timestamp.as_ref()));
         if let Some(ts) = event_timestamp {
-            latest_event_timestamp = Some(ts.clone());
+            self.latest_event_timestamp = Some(ts.clone());
         }
 
         let primary = parsed_line
@@ -521,10 +705,10 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
         if primary.is_some() || secondary.is_some() {
             let limit_timestamp = event_timestamp
                 .cloned()
-                .or_else(|| latest_event_timestamp.clone())
-                .or_else(|| session_timestamp.clone())
+                .or_else(|| self.latest_event_timestamp.clone())
+                .or_else(|| self.session_timestamp.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            latest_limits = Some(CodexRateLimits {
+            self.latest_limits = Some(CodexRateLimits {
                 timestamp: limit_timestamp,
                 primary,
                 secondary,
@@ -538,39 +722,57 @@ fn parse_codex_session_reader<R: BufRead>(mut reader: R) -> ParsedSessionContent
 
         if let Some(info) = maybe_info {
             if let Some(total_usage) = info.total_token_usage.as_ref() {
-                input_tokens = total_usage.input_tokens;
-                output_tokens = total_usage.output_tokens;
-                cached_input_tokens = total_usage.cached_input_tokens;
-                has_token_usage = true;
+                self.input_tokens = total_usage.input_tokens;
+                self.output_tokens = total_usage.output_tokens;
+                self.cached_input_tokens = total_usage.cached_input_tokens;
+                self.has_token_usage = true;
             }
             if let Some(window) = info.model_context_window {
-                context_window = window;
+                self.context_window = window;
             }
         }
     }
 
-    if parsed_json_lines == 0 {
+    fn finish(self) -> ParsedSessionContents {
+        if self.parsed_json_lines == 0 {
+            return ParsedSessionContents::ParseError;
+        }
+
+        let timestamp = match self
+            .latest_event_timestamp
+            .clone()
+            .or_else(|| self.session_timestamp.clone())
+        {
+            Some(timestamp) => timestamp,
+            None => return ParsedSessionContents::NoUsageOrLimits,
+        };
+
+        if !self.has_token_usage && self.latest_limits.is_none() {
+            return ParsedSessionContents::NoUsageOrLimits;
+        }
+
+        ParsedSessionContents::Parsed(CodexSessionData {
+            parsed_len: self.parsed_len,
+            session_timestamp: self.session_timestamp,
+            latest_event_timestamp: self.latest_event_timestamp,
+            timestamp,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            context_window: self.context_window,
+            has_token_usage: self.has_token_usage,
+            limits: self.latest_limits,
+        })
+    }
+}
+
+#[cfg(test)]
+fn parse_codex_session_reader<R: BufRead>(reader: R) -> ParsedSessionContents {
+    let mut parser = CodexSessionParser::default();
+    if parser.parse_reader(reader, 0, true).is_err() {
         return ParsedSessionContents::ParseError;
     }
-
-    let timestamp = match latest_event_timestamp.or(session_timestamp) {
-        Some(timestamp) => timestamp,
-        None => return ParsedSessionContents::NoUsageOrLimits,
-    };
-
-    if !has_token_usage && latest_limits.is_none() {
-        return ParsedSessionContents::NoUsageOrLimits;
-    }
-
-    ParsedSessionContents::Parsed(CodexSessionData {
-        timestamp,
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        context_window,
-        has_token_usage,
-        limits: latest_limits,
-    })
+    parser.finish()
 }
 
 fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> Option<CodexRateLimit> {
@@ -617,6 +819,7 @@ fn find_latest_limits(sessions: &HashMap<PathBuf, CachedCodexSession>) -> Option
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -701,6 +904,12 @@ mod tests {
             CachedCodexSession {
                 modified: older,
                 file_len: 100,
+                parsed_len: 100,
+                file_identity: None,
+                prefix_fingerprint: 0,
+                boundary_fingerprint: 0,
+                session_timestamp: None,
+                latest_event_timestamp: Some("2026-02-18T00:00:00Z".to_string()),
                 timestamp: "2026-02-18T00:00:00Z".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -723,6 +932,12 @@ mod tests {
             CachedCodexSession {
                 modified: newer,
                 file_len: 110,
+                parsed_len: 110,
+                file_identity: None,
+                prefix_fingerprint: 0,
+                boundary_fingerprint: 0,
+                session_timestamp: None,
+                latest_event_timestamp: Some("2026-02-17T23:59:59Z".to_string()),
                 timestamp: "2026-02-17T23:59:59Z".to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -792,7 +1007,7 @@ mod tests {
         assert_eq!(diagnostics.no_usage_or_limits_files, 1);
         assert_eq!(diagnostics.unreadable_files, 0);
         assert_eq!(diagnostics.discovery_interval, MIN_DISCOVERY_INTERVAL);
-        assert!(diagnostics.last_import_at.is_some());
+        assert!(diagnostics.last_attempt_at.is_some());
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -929,6 +1144,99 @@ mod tests {
         fs::remove_dir_all(root).expect("remove test directory");
     }
 
+    #[test]
+    fn append_refresh_reuses_state_and_waits_for_a_complete_jsonl_record() {
+        let root = make_temp_dir("codex-incremental");
+        let session = root.join("session.jsonl");
+        write_token_session(&session, 100);
+
+        let mut config = AppConfig::default();
+        config.codex_import.sessions_dir = Some(root.to_string_lossy().into_owned());
+        let mut cache = CodexImportCache::default();
+        merge_codex_usage(&config, &mut cache);
+
+        assert_eq!(
+            codex_session_snapshot(&cache)
+                .expect("initial snapshot")
+                .latest_input,
+            100
+        );
+        let initial_parsed_len = cache
+            .sessions
+            .get(&session)
+            .expect("cached session")
+            .parsed_len;
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .expect("open session for append");
+        let appended = token_session_line(200);
+        file.write_all(appended.as_bytes())
+            .expect("write partial event");
+        merge_codex_usage(&config, &mut cache);
+
+        let cached = cache
+            .sessions
+            .get(&session)
+            .expect("cached partial session");
+        assert_eq!(cached.parsed_len, initial_parsed_len);
+        assert_eq!(
+            codex_session_snapshot(&cache)
+                .expect("snapshot while partial")
+                .latest_input,
+            100
+        );
+
+        file.write_all(b"\n").expect("complete event");
+        merge_codex_usage(&config, &mut cache);
+        assert_eq!(
+            codex_session_snapshot(&cache)
+                .expect("snapshot after append")
+                .latest_input,
+            200
+        );
+        assert!(
+            cache
+                .sessions
+                .get(&session)
+                .expect("completed session")
+                .parsed_len
+                > initial_parsed_len
+        );
+
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn replacement_with_a_longer_prefix_rebuilds_instead_of_replaying_old_state() {
+        let root = make_temp_dir("codex-replacement");
+        let session = root.join("session.jsonl");
+        write_token_session(&session, 100);
+
+        let mut config = AppConfig::default();
+        config.codex_import.sessions_dir = Some(root.to_string_lossy().into_owned());
+        let mut cache = CodexImportCache::default();
+        merge_codex_usage(&config, &mut cache);
+        assert!(codex_session_snapshot(&cache).is_some());
+
+        let replacement = concat!(
+            "{\"timestamp\":\"2026-08-20T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"timestamp\":\"2026-08-20T00:00:00Z\"}}\n",
+            "{\"timestamp\":\"2026-08-20T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}\n",
+            "{\"timestamp\":\"2026-08-20T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}\n"
+        );
+        assert!(replacement.len() as u64 > session.metadata().expect("metadata").len());
+        fs::write(&session, replacement).expect("replace session");
+
+        merge_codex_usage(&config, &mut cache);
+
+        assert!(codex_session_snapshot(&cache).is_none());
+        assert!(!cache.sessions.contains_key(&session));
+        assert_eq!(cache.diagnostics.no_usage_or_limits_files, 1);
+
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
     fn fixture_contents(name: &str) -> String {
         fs::read_to_string(fixture_path(name)).expect("read fixture file")
     }
@@ -940,10 +1248,14 @@ mod tests {
     }
 
     fn write_token_session(path: &Path, input_tokens: u64) {
-        let contents = format!(
-            r#"{{"timestamp":"2026-08-19T00:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input_tokens},"output_tokens":10}},"model_context_window":1000}}}}}}"#
-        );
+        let contents = format!("{}\n", token_session_line(input_tokens));
         fs::write(path, contents).expect("write token session");
+    }
+
+    fn token_session_line(input_tokens: u64) -> String {
+        format!(
+            r#"{{"timestamp":"2026-08-19T00:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input_tokens},"output_tokens":10}},"model_context_window":1000}}}}}}"#
+        )
     }
 
     fn fixture_path(name: &str) -> PathBuf {
