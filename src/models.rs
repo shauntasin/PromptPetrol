@@ -25,6 +25,7 @@ pub(crate) struct AppConfig {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Theme {
     #[default]
+    Carbon,
     Murphy,
     Dracula,
     Nord,
@@ -39,6 +40,7 @@ pub(crate) enum Theme {
 impl Theme {
     pub(crate) const fn next(self) -> Self {
         match self {
+            Self::Carbon => Self::Murphy,
             Self::Murphy => Self::Dracula,
             Self::Paper => Self::Arctic,
             Self::Dracula => Self::Nord,
@@ -46,12 +48,13 @@ impl Theme {
             Self::Gruvbox => Self::TokyoNight,
             Self::TokyoNight => Self::Paper,
             Self::Arctic => Self::SolarizedLight,
-            Self::SolarizedLight => Self::Murphy,
+            Self::SolarizedLight => Self::Carbon,
         }
     }
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Carbon => "CARBON",
             Self::Murphy => "MURPHY",
             Self::Dracula => "DRACULA",
             Self::Nord => "NORD",
@@ -106,9 +109,21 @@ pub(crate) fn default_config_file() -> Result<PathBuf> {
 }
 
 fn default_config_base_dir() -> Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .ok_or_else(|| eyre!("cannot determine config directory; use --config-file"))?
-        .join("promptpetrol"))
+    let home = dirs::home_dir()
+        .ok_or_else(|| eyre!("cannot determine config directory; use --config-file"))?;
+    let preferred = home.join(".config").join("promptpetrol");
+    let legacy = dirs::config_dir().map(|dir| dir.join("promptpetrol"));
+    Ok(select_config_base_dir(preferred, legacy))
+}
+
+fn select_config_base_dir(preferred: PathBuf, legacy: Option<PathBuf>) -> PathBuf {
+    if !preferred.join("config.json").exists()
+        && let Some(legacy) = legacy
+        && legacy.join("config.json").exists()
+    {
+        return legacy;
+    }
+    preferred
 }
 
 pub(crate) fn load_or_bootstrap_config(path: &Path) -> Result<AppConfig> {
@@ -191,24 +206,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_path_preserves_existing_platform_config() {
+        let root = temp_path("config-path");
+        let preferred = root.join("preferred");
+        let legacy = root.join("legacy");
+        assert_eq!(
+            select_config_base_dir(preferred.clone(), Some(legacy.clone())),
+            preferred
+        );
+        fs::create_dir_all(&legacy).expect("legacy directory");
+        fs::write(legacy.join("config.json"), "{}").expect("legacy config");
+        assert_eq!(
+            select_config_base_dir(preferred.clone(), Some(legacy.clone())),
+            legacy
+        );
+        fs::create_dir_all(&preferred).expect("preferred directory");
+        fs::write(preferred.join("config.json"), "{}").expect("preferred config");
+        assert_eq!(
+            select_config_base_dir(preferred.clone(), Some(legacy)),
+            preferred
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn bootstrap_creates_missing_parent_directories() {
         let root = temp_path("nested-config");
         let path = root.join("nested").join("config.json");
 
         let config = load_or_bootstrap_config(&path).expect("bootstrap config");
 
-        assert_eq!(config.theme, Theme::Murphy);
+        assert_eq!(config.theme, Theme::Carbon);
         assert!(config.codex_import.enabled);
         assert!(path.is_file());
         fs::remove_dir_all(root).expect("remove test directory");
     }
 
     #[test]
-    fn themes_deserialize_by_config_name_and_default_to_murphy() {
+    fn themes_deserialize_by_config_name_and_default_to_carbon() {
         let default: AppConfig = serde_json::from_str("{}").expect("default config");
-        assert_eq!(default.theme, Theme::Murphy);
+        assert_eq!(default.theme, Theme::Carbon);
 
         for (name, expected) in [
+            ("carbon", Theme::Carbon),
+            ("murphy", Theme::Murphy),
             ("dracula", Theme::Dracula),
             ("nord", Theme::Nord),
             ("gruvbox", Theme::Gruvbox),

@@ -24,7 +24,17 @@ Thumbs.db
 *.tmp
 tmp/
 
-# Codex / agent-related local artifacts
+# Local assistant metadata and documentation
 .codex/
 AGENTS.md
 .promptpetrol-context.md
+
+*.md
+*.MD
+.claude/
+.agents/
+.cursor/
+.github/copilot-instructions.*
+.aider*
+.clinerules
+.cursorrules

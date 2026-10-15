@@ -127,6 +127,8 @@ struct CodexTokenInfo {
     #[serde(default)]
     total_token_usage: Option<CodexTotalTokenUsage>,
     #[serde(default)]
+    last_token_usage: Option<CodexTotalTokenUsage>,
+    #[serde(default)]
     model_context_window: Option<u64>,
 }
 
@@ -138,6 +140,8 @@ struct CodexTotalTokenUsage {
     output_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,7 +245,6 @@ impl CodexImportCache {
         cache.latest_session = Some(CodexSessionSnapshot {
             latest_input: input,
             latest_output: output,
-            latest_cached: cached,
             latest_context_window: window,
             latest_timestamp: Some("2026-06-18T00:00:00Z".to_string()),
         });
@@ -412,7 +415,6 @@ fn tune_discovery_interval(cache: &mut CodexImportCache, changes_detected: bool)
 pub(crate) struct CodexSessionSnapshot {
     pub(crate) latest_input: u64,
     pub(crate) latest_output: u64,
-    pub(crate) latest_cached: u64,
     pub(crate) latest_context_window: u64,
     #[cfg(test)]
     pub(crate) latest_timestamp: Option<String>,
@@ -627,19 +629,21 @@ impl CodexSessionParser {
         allow_partial_line: bool,
     ) -> io::Result<u64> {
         let mut committed_len = start_offset;
-        let mut line = String::new();
+        let mut line = Vec::new();
 
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line)?;
+            let bytes_read = reader.read_until(b'\n', &mut line)?;
             if bytes_read == 0 {
                 break;
             }
 
-            let complete = line.ends_with('\n');
+            let complete = line.ends_with(b"\n");
             if complete || allow_partial_line {
                 committed_len += bytes_read as u64;
-                self.accept_line(line.trim_end_matches(['\n', '\r']));
+                if let Ok(text) = std::str::from_utf8(&line) {
+                    self.accept_line(text.trim_end_matches(['\n', '\r']));
+                }
             }
             if !complete {
                 break;
@@ -721,10 +725,19 @@ impl CodexSessionParser {
             .and_then(|payload| payload.info.as_ref());
 
         if let Some(info) = maybe_info {
-            if let Some(total_usage) = info.total_token_usage.as_ref() {
-                self.input_tokens = total_usage.input_tokens;
-                self.output_tokens = total_usage.output_tokens;
-                self.cached_input_tokens = total_usage.cached_input_tokens;
+            if let Some(usage) = info
+                .last_token_usage
+                .as_ref()
+                .or(info.total_token_usage.as_ref())
+            {
+                // Cached input still occupies context. Compaction estimates can
+                // contain only total_tokens, with input/output both zero.
+                self.output_tokens = usage.output_tokens;
+                self.input_tokens = usage
+                    .total_tokens
+                    .map(|total| total.saturating_sub(usage.output_tokens))
+                    .unwrap_or(usage.input_tokens);
+                self.cached_input_tokens = usage.cached_input_tokens;
                 self.has_token_usage = true;
             }
             if let Some(window) = info.model_context_window {
@@ -785,18 +798,21 @@ fn parse_codex_rate_limit(node: &CodexRawRateLimit) -> Option<CodexRateLimit> {
     })
 }
 
+fn event_time(timestamp: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(timestamp).ok()
+}
+
 fn find_latest_session(
     sessions: &HashMap<PathBuf, CachedCodexSession>,
 ) -> Option<CodexSessionSnapshot> {
     let latest = sessions
         .values()
         .filter(|session| session.has_token_usage)
-        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))?;
+        .max_by_key(|session| (event_time(&session.timestamp), session.modified))?;
 
     Some(CodexSessionSnapshot {
         latest_input: latest.input_tokens,
         latest_output: latest.output_tokens,
-        latest_cached: latest.cached_input_tokens,
         latest_context_window: latest.context_window,
         #[cfg(test)]
         latest_timestamp: Some(latest.timestamp.clone()),
@@ -812,7 +828,7 @@ fn find_latest_limits(sessions: &HashMap<PathBuf, CachedCodexSession>) -> Option
                 .as_ref()
                 .map(|limits| (session.modified, &limits.timestamp, limits))
         })
-        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .max_by_key(|entry| (event_time(entry.1), entry.0))
         .map(|(_, _, limits)| limits.clone())
 }
 
@@ -825,6 +841,41 @@ mod tests {
 
     use super::*;
     use crate::models::AppConfig;
+
+    #[test]
+    fn invalid_utf8_record_does_not_discard_valid_usage() {
+        let mut contents = b"\xff\n".to_vec();
+        contents.extend_from_slice(br#"{"timestamp":"2026-10-14T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":123}}}}
+"#);
+        let ParsedSessionContents::Parsed(parsed) = parse_codex_session_reader(&contents[..])
+        else {
+            panic!("valid usage after malformed record was lost");
+        };
+        assert_eq!(parsed.input_tokens, 123);
+    }
+
+    #[test]
+    fn context_uses_latest_turn_including_cached_input() {
+        let payload = r#"{"timestamp":"2026-10-14T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900000},"last_token_usage":{"input_tokens":40000,"cached_input_tokens":30000,"output_tokens":1000,"total_tokens":41000},"model_context_window":200000}}}"#;
+        let parsed = parse_codex_session_contents(payload).expect("usage");
+        assert_eq!(parsed.input_tokens, 40000);
+        assert_eq!(parsed.output_tokens, 1000);
+        assert_eq!(parsed.cached_input_tokens, 30000);
+    }
+
+    #[test]
+    fn context_accepts_compaction_estimates_with_only_total_tokens() {
+        let payload = r#"{"timestamp":"2026-10-14T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":12000},"model_context_window":200000}}}"#;
+        let parsed = parse_codex_session_contents(payload).expect("usage");
+        assert_eq!(parsed.input_tokens, 12000);
+        assert_eq!(parsed.output_tokens, 0);
+    }
+
+    #[test]
+    fn event_timestamps_compare_instants_across_offsets() {
+        assert!(event_time("2026-10-14T01:00:00+05:30") < event_time("2026-10-13T23:00:00Z"));
+        assert_eq!(event_time("unknown"), None);
+    }
 
     #[test]
     fn parses_codex_session_usage_from_token_count_events() {
@@ -894,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_codex_limits_prefers_newest_session_file() {
+    fn latest_codex_limits_prefers_event_time_over_file_modification() {
         let mut cache = CodexImportCache::default();
         let older = UNIX_EPOCH + Duration::from_secs(100);
         let newer = UNIX_EPOCH + Duration::from_secs(200);
@@ -956,7 +1007,7 @@ mod tests {
         );
 
         let limits = latest_codex_limits(&cache).expect("expected limits");
-        assert_eq!(limits.primary.expect("primary").used_percent, 4.0);
+        assert_eq!(limits.primary.expect("primary").used_percent, 12.0);
     }
 
     #[test]

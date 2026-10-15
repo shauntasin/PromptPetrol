@@ -14,9 +14,9 @@ use crate::codex_import::{CodexImportCache, merge_codex_usage};
 use crate::models::{AppConfig, Theme, default_config_file, load_or_bootstrap_config};
 use crate::ui::draw;
 
-/// UI redraw cadence: 500ms == 2 Hz. The render tick is cheap (it only paints
+/// UI redraw cadence: 100ms == 10 Hz. The render tick is cheap (it only paints
 /// cached state), so it can run far faster than the data refresh.
-pub(crate) const RENDER_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Data refresh cadence: how often the costly work (network fetch + session
 /// scan) runs. Kept slow to avoid spamming the Claude API.
@@ -205,7 +205,7 @@ pub(crate) fn run(
         terminal.draw(|frame| draw(frame, app))?;
 
         // Wait up to one render tick for input; redraw on timeout for a smooth
-        // 2 Hz UI without touching the network or disk every frame.
+        // 10 Hz UI without touching the network or disk every frame.
         if event::poll(RENDER_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -368,11 +368,11 @@ mod tests {
             ClaudeImportDiagnostics::default(),
         );
 
-        assert_eq!(app.active_theme(), Theme::Murphy);
+        assert_eq!(app.active_theme(), Theme::Carbon);
         app.cycle_theme();
-        assert_eq!(app.active_theme(), Theme::Dracula);
+        assert_eq!(app.active_theme(), Theme::Murphy);
         app.config.theme = Theme::Arctic;
-        assert_eq!(app.active_theme(), Theme::Dracula);
+        assert_eq!(app.active_theme(), Theme::Murphy);
     }
 
     fn temp_path(label: &str) -> PathBuf {

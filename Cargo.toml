@@ -2,10 +2,10 @@
 name = "promptpetrol"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A local terminal dashboard for Claude and Codex usage"
 repository = "https://github.com/shauntasin/PromptPetrol"
-readme = "README.md"
+readme = false
 
 [dependencies]
 chrono = "0.4"
