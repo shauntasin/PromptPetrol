@@ -35,6 +35,7 @@ pub(crate) enum Theme {
     Arctic,
     #[serde(alias = "solarized")]
     SolarizedLight,
+    Transparent,
 }
 
 impl Theme {
@@ -48,7 +49,8 @@ impl Theme {
             Self::Gruvbox => Self::TokyoNight,
             Self::TokyoNight => Self::Paper,
             Self::Arctic => Self::SolarizedLight,
-            Self::SolarizedLight => Self::Carbon,
+            Self::SolarizedLight => Self::Transparent,
+            Self::Transparent => Self::Carbon,
         }
     }
 
@@ -63,6 +65,7 @@ impl Theme {
             Self::Paper => "PAPER",
             Self::Arctic => "ARCTIC",
             Self::SolarizedLight => "SOLARIZED LIGHT",
+            Self::Transparent => "TRANSPARENT",
         }
     }
 }
@@ -258,6 +261,7 @@ mod tests {
             ("arctic", Theme::Arctic),
             ("solarized-light", Theme::SolarizedLight),
             ("solarized", Theme::SolarizedLight),
+            ("transparent", Theme::Transparent),
         ] {
             let config: AppConfig =
                 serde_json::from_str(&format!(r#"{{"theme":"{name}"}}"#)).expect("named theme");

@@ -183,6 +183,23 @@ const SOLARIZED_LIGHT: Palette = Palette {
     critical: Color::Rgb(220, 50, 47),
 };
 
+// Transparent leaves the terminal's own background showing through by using
+// `Color::Reset` for background and surface; only glyphs and borders are painted.
+const TRANSPARENT: Palette = Palette {
+    background: Color::Reset,
+    surface: Color::Reset,
+    normal: Color::Rgb(0, 255, 157),
+    separator: Color::Rgb(127, 133, 153),
+    accent: Color::Rgb(88, 214, 241),
+    label: Color::Rgb(255, 221, 130),
+    warning: Color::Rgb(255, 158, 100),
+    decorative: Color::Rgb(211, 134, 255),
+    text: Color::Rgb(255, 255, 255),
+    muted: Color::Rgb(160, 170, 190),
+    dim: Color::Rgb(110, 120, 140),
+    critical: Color::Rgb(255, 77, 96),
+};
+
 const fn palette_for(theme: Theme) -> Palette {
     match theme {
         Theme::Carbon => CARBON,
@@ -194,6 +211,7 @@ const fn palette_for(theme: Theme) -> Palette {
         Theme::Paper => PAPER,
         Theme::Arctic => ARCTIC,
         Theme::SolarizedLight => SOLARIZED_LIGHT,
+        Theme::Transparent => TRANSPARENT,
     }
 }
 
@@ -1522,6 +1540,7 @@ mod tests {
             Theme::Paper,
             Theme::Arctic,
             Theme::SolarizedLight,
+            Theme::Transparent,
         ] {
             let palette = palette_for(theme);
             for (width, height) in [(120, 40), (60, 20)] {
