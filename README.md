@@ -165,6 +165,8 @@ Planning documents live in [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/SCALING_
 
 ## License
 
-The repository does not currently declare a license. Choose and add a license
-file before publishing the crate publicly; Cargo will then accept the matching
-`license` or `license-file` metadata in `Cargo.toml`.
+PromptPetrol is licensed under the **GNU Affero General Public License v3.0
+only** (`AGPL-3.0-only`). See the official [license text](https://www.gnu.org/licenses/agpl-3.0.html).
+
+AGPLv3 is strong copyleft: modified versions, including versions offered over
+a network, must preserve the license and provide corresponding source to users.
