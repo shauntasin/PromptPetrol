@@ -63,7 +63,9 @@ fn parse_cli_args_from(args: impl IntoIterator<Item = String>) -> Result<CliActi
             }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
-            _ => bail!("unknown argument: {arg}"),
+            _ => {
+                bail!("unknown argument: {arg}");
+            }
         }
     }
 
