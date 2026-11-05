@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "A local terminal dashboard for Claude and Codex usage"
 repository = "https://github.com/shauntasin/PromptPetrol"
-readme = false
+readme = "README.md"
 
 [dependencies]
 chrono = "0.4"
